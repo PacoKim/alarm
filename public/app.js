@@ -1,5 +1,7 @@
 /* 우리가족 알림 — 프레임워크 없는 단일 파일 앱 */
 
+import { parseKoreanSchedule } from "/nlp.js";
+
 const TOKEN_KEY = "fr.token";
 const root = document.getElementById("root");
 
@@ -26,6 +28,27 @@ const esc = (s) =>
   );
 
 const WD = ["일", "월", "화", "수", "목", "금", "토"];
+
+/** 이름의 첫 글자로 만드는 아바타 */
+function avatar(member, cls = "") {
+  if (!member) return "";
+  const initial = String(member.name || "?").trim().slice(0, 1);
+  return `<span class="avatar ${cls}" style="background:${esc(member.color || "#7a8396")}"
+    >${esc(initial)}</span>`;
+}
+
+function memberOf(id) {
+  return state.members.find((m) => m.id === id) ?? null;
+}
+
+/** '18:00' -> { h: '6:00', ampm: '오후' } */
+function splitTime(time) {
+  if (!time) return null;
+  const [h, m] = time.split(":").map(Number);
+  const ampm = h < 12 ? "오전" : "오후";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return { h: `${h12}:${String(m).padStart(2, "0")}`, ampm };
+}
 
 function todayISO() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Seoul" }).format(new Date());
@@ -141,10 +164,19 @@ function renderOnboard() {
   root.innerHTML = `
     <div class="onboard">
       <img class="logo" src="/icons/icon-192.png" alt="" />
-      <h1>우리가족 알림</h1>
-      <p class="lede">일정과 메모를 가족이 함께 모아두고,<br />잠금화면 위젯으로 바로 확인해요.</p>
-      <button class="btn" data-action="show-create">가족 공간 만들기</button>
-      <button class="btn ghost" data-action="show-join">초대 코드로 참여하기</button>
+      <h1>가족의 하루를<br /><em>잠금화면에서</em> 확인하세요</h1>
+      <p class="lede">
+        일정과 메모를 가족이 한곳에 모아두면,
+        아이폰 잠금화면 위젯에 바로 떠서 아무도 잊지 않습니다.
+      </p>
+      <button class="btn" data-action="show-join">초대 코드로 참여하기</button>
+      <button class="btn ghost" data-action="show-create">가족 공간 새로 만들기</button>
+      <p class="foot">
+        가족에게 초대 코드를 받았다면 위쪽을 누르세요.<br />
+        <a href="#" data-action="install-guide"
+           style="color:var(--brand);font-weight:700;text-decoration:none">
+          휴대폰에 앱으로 설치하는 방법 →</a>
+      </p>
     </div>`;
 }
 
@@ -285,67 +317,124 @@ function render() {
   if (state.stage === "picker") return renderPicker();
 
   const openMemos = state.memos.filter((m) => !m.done).length;
-  const todayCount = state.events.filter((e) => e.date === state.today).length;
+  const todayEvents = state.events.filter((e) => e.date === state.today);
+  const isEvents = state.tab === "events";
 
   root.innerHTML = `
     <div class="app">
       <header class="topbar">
-        <h1>${esc(state.family?.name ?? "우리가족")}
+        <span class="brand-mark">📅</span>
+        <span class="titles">
+          <h1>${esc(state.family?.name ?? "우리가족")}</h1>
           <span class="sub">${
-            state.me?.name
-              ? `${esc(state.me.name)} 님 · `
-              : ""
-          }${shortDate(state.today)} · 오늘 일정 ${todayCount}개</span>
-        </h1>
-        <span class="spacer"></span>
+            state.me?.name ? `${esc(state.me.name)} 님으로 로그인` : "가족 공간"
+          }</span>
+        </span>
         <button class="icon-btn" data-action="refresh" aria-label="새로 고침">↻</button>
         <button class="icon-btn" data-action="settings" aria-label="설정">⚙</button>
       </header>
 
-      <div class="tabs" role="tablist">
-        <button class="tab" role="tab" data-action="tab" data-tab="events"
-                aria-selected="${state.tab === "events"}">일정</button>
-        <button class="tab" role="tab" data-action="tab" data-tab="memos"
-                aria-selected="${state.tab === "memos"}">메모
-          ${openMemos ? `<span class="count">${openMemos}</span>` : ""}</button>
-      </div>
+      <main>
+        ${heroCard(todayEvents, openMemos)}
 
-      <main>${state.tab === "events" ? eventsView() : memosView()}</main>
+        <div class="tabs" role="tablist" data-tab="${state.tab}">
+          <span class="glider"></span>
+          <button class="tab" role="tab" data-action="tab" data-tab="events"
+                  aria-selected="${isEvents}">일정</button>
+          <button class="tab" role="tab" data-action="tab" data-tab="memos"
+                  aria-selected="${!isEvents}">메모
+            ${openMemos ? `<span class="count">${openMemos}</span>` : ""}</button>
+        </div>
+
+        ${isEvents ? eventsView() : memosView()}
+      </main>
 
       <div class="fab-bar">
-        <button class="fab" data-action="${state.tab === "events" ? "new-event" : "new-memo"}">
-          ${state.tab === "events" ? "+  일정 추가" : "+  메모 추가"}
-        </button>
+        <div class="fab-inner">
+          <button class="fab" data-action="${isEvents ? "new-event" : "new-memo"}">
+            <span>＋</span><span>${isEvents ? "일정 추가" : "메모 추가"}</span>
+          </button>
+          ${
+            voiceSupported()
+              ? `<button class="fab-mic" data-action="voice"
+                         aria-label="음성으로 추가">🎙️</button>`
+              : ""
+          }
+        </div>
       </div>
     </div>`;
 }
 
+/** 오늘 요약 카드 */
+function heroCard(todayEvents, openMemos) {
+  const [y, m, d] = state.today.split("-").map(Number);
+  const wd = WD[new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
+
+  // 오늘 남은 일정 중 가장 이른 것
+  const now = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date());
+  const next =
+    todayEvents.find((e) => e.time && e.time >= now) ??
+    state.events.find((e) => e.date > state.today);
+
+  return `
+    <section class="hero">
+      <div class="eyebrow">오늘</div>
+      <div class="date"><b>${m}월 ${d}일</b><span>${wd}요일</span></div>
+      <div class="stats">
+        <div class="stat"><div class="n">${todayEvents.length}</div><div class="l">오늘 일정</div></div>
+        <div class="stat"><div class="n">${openMemos}</div><div class="l">할 일·메모</div></div>
+        <div class="stat"><div class="n">${state.members.length}</div><div class="l">가족</div></div>
+      </div>
+      ${
+        next
+          ? `<div class="next">
+               <span class="badge">${next.date === state.today ? "다음" : esc(next.dayLabel)}</span>
+               <span class="t">${next.time ? esc(next.timeLabel) + " · " : ""}${esc(next.title)}</span>
+             </div>`
+          : `<div class="next"><span class="t">남은 일정이 없어요. 편하게 쉬세요 🌿</span></div>`
+      }
+    </section>`;
+}
+
 const RELATIVE_LABELS = new Set(["오늘", "내일", "모레", "어제"]);
 
-/** 시간·장소·담당·반복을 있는 것만 " · "로 이어 붙인다 */
+/** 장소·담당·개인여부·반복을 배지와 점으로 표시한다 */
 function eventMeta(ev) {
   const parts = [];
-  if (ev.visibility === "private") parts.push('<span class="lock">🔒 나만</span>');
-  if (ev.time) parts.push(esc(ev.timeLabel));
-  if (ev.location) parts.push(esc(ev.location));
-  const name = memberName(ev.member_id);
-  if (name) parts.push(memberDot(memberColor(ev.member_id), name));
-  if (ev.repeat && ev.repeat !== "none") parts.push("반복");
+  if (ev.visibility === "private") parts.push('<span class="tag lock">🔒 나만</span>');
+  if (ev.location) parts.push(`<span>${esc(ev.location)}</span>`);
+
+  const member = memberOf(ev.member_id);
+  if (member) parts.push(`<span class="who">${avatar(member)}${esc(member.name)}</span>`);
+  if (ev.repeat && ev.repeat !== "none") {
+    parts.push(`<span class="tag repeat">${esc(REPEAT_SHORT[ev.repeat] ?? "반복")}</span>`);
+  }
   if (!parts.length) return "";
-  return `<span class="meta">${parts.join(' <span aria-hidden="true">·</span> ')}</span>`;
+  return `<span class="meta">${parts.join('<span class="sep">·</span>')}</span>`;
 }
 
-function memberDot(color, name) {
-  if (!name) return "";
-  return `<span class="who"><span class="dot" style="background:${esc(color || "#888")}"></span>${esc(name)}</span>`;
-}
+const REPEAT_SHORT = {
+  daily: "매일",
+  weekly: "매주",
+  monthly: "매월",
+  yearly: "매년",
+};
 
 function eventsView() {
   const upcoming = state.events.filter((e) => e.date >= state.today);
   if (!upcoming.length) {
-    return `<div class="empty"><div class="big">🗓️</div>
-      <p>등록된 일정이 없어요.<br />아래 버튼으로 첫 일정을 추가해 보세요.</p></div>`;
+    return `<div class="empty">
+      <div class="art">🗓️</div>
+      <h3>아직 일정이 없어요</h3>
+      <p>아래 버튼을 누르거나 🎙️ 를 눌러<br />"내일 오후 3시 치과"처럼 말해보세요.</p>
+    </div>`;
   }
+
+  const now = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date());
 
   const groups = new Map();
   for (const ev of upcoming) {
@@ -359,38 +448,45 @@ function eventsView() {
       const label = list[0].dayLabel;
       return `
       <section class="day-group ${isToday ? "is-today" : ""}">
-        <div class="day-head"><b>${esc(label)}</b>
-          ${RELATIVE_LABELS.has(label) ? `<span class="date">${shortDate(date)}</span>` : ""}</div>
-        <div class="card">
-          ${list
-            .map(
-              (ev) => `
-            <button class="row" data-action="open-event" data-id="${esc(ev.id)}">
-              <span class="when ${ev.time ? "" : "allday"}">${esc(ev.time ? ev.timeLabel.replace(/^(오전|오후) /, "") : "종일")}</span>
-              <span class="body">
-                <span class="title">${esc(ev.title)}</span>
-                ${eventMeta(ev)}
-              </span>
-            </button>`,
-            )
-            .join("")}
+        <div class="day-head">
+          <b>${esc(label)}</b>
+          ${RELATIVE_LABELS.has(label) ? `<span class="date">${shortDate(date)}</span>` : ""}
+          <span class="pill">${list.length}개</span>
         </div>
+        <div class="card">${list.map((ev) => eventRow(ev, isToday, now)).join("")}</div>
       </section>`;
     })
     .join("");
 }
 
-function memberName(id) {
-  return state.members.find((m) => m.id === id)?.name ?? null;
-}
-function memberColor(id) {
-  return state.members.find((m) => m.id === id)?.color ?? null;
+function eventRow(ev, isToday, now) {
+  const t = splitTime(ev.time);
+  const upcomingNow = isToday && ev.time && ev.time >= now;
+
+  return `
+    <button class="row ${upcomingNow ? "is-now" : ""}"
+            data-action="open-event" data-id="${esc(ev.id)}">
+      <span class="when ${t ? "" : "allday"}">
+        ${
+          t
+            ? `<span class="ampm">${t.ampm}</span><span class="h">${t.h}</span>`
+            : `<span class="h">종일</span>`
+        }
+      </span>
+      <span class="body">
+        <span class="title">${esc(ev.title)}</span>
+        ${eventMeta(ev)}
+      </span>
+    </button>`;
 }
 
 function memosView() {
   if (!state.memos.length) {
-    return `<div class="empty"><div class="big">📝</div>
-      <p>메모가 없어요.<br />고정한 메모는 위젯에 바로 표시돼요.</p></div>`;
+    return `<div class="empty">
+      <div class="art">📝</div>
+      <h3>메모가 비어 있어요</h3>
+      <p>장보기 목록, 현관 비밀번호, 준비물처럼<br />가족이 잊기 쉬운 것들을 적어두세요.</p>
+    </div>`;
   }
 
   const open = state.memos.filter((m) => !m.done);
@@ -400,7 +496,7 @@ function memosView() {
     !list.length
       ? ""
       : `<section class="day-group">
-          ${heading ? `<div class="day-head"><b>${heading}</b></div>` : ""}
+          <div class="day-head"><b>${heading}</b><span class="pill">${list.length}개</span></div>
           <div class="card">${list.map(memoRow).join("")}</div>
         </section>`;
 
@@ -408,23 +504,206 @@ function memosView() {
 }
 
 function memoRow(m) {
+  const member = memberOf(m.member_id);
+  const tags = [];
+  if (m.visibility === "private") tags.push('<span class="tag lock">🔒 나만</span>');
+  if (member) tags.push(`<span class="who">${avatar(member)}${esc(member.name)}</span>`);
+
   return `
     <div class="row memo-row ${m.done ? "done" : ""}">
       <button class="check" data-action="toggle-memo" data-id="${esc(m.id)}"
               aria-label="완료 표시">✓</button>
       <button class="body" style="background:none;border:none;padding:0;text-align:left"
               data-action="open-memo" data-id="${esc(m.id)}">
-        <span class="title">${m.pinned ? `<span class="pin">📌</span> ` : ""}${
-          m.visibility === "private" ? `<span class="lock">🔒</span> ` : ""
+        <span class="title">${
+          m.pinned ? `<span class="pin-mark">📌</span> ` : ""
         }${esc(m.text)}</span>
-        <span class="meta">${[
-          m.visibility === "private" ? '<span class="lock">나만 보기</span>' : "",
-          memberDot(memberColor(m.member_id), memberName(m.member_id)),
-        ]
-          .filter(Boolean)
-          .join(' <span aria-hidden="true">·</span> ')}</span>
+        ${tags.length ? `<span class="meta">${tags.join('<span class="sep">·</span>')}</span>` : ""}
       </button>
     </div>`;
+}
+
+/* ------------------------------ 음성 입력 ------------------------------ */
+
+function SpeechRec() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
+function voiceSupported() {
+  return !!SpeechRec();
+}
+
+let recognizer = null;
+
+/** 음성 입력 시트. 말한 내용을 해석해 미리 보여주고 확인받는다. */
+function voiceSheet() {
+  const target = state.tab === "memos" ? "memo" : "event";
+
+  openSheet(`
+    <h2>${target === "event" ? "음성으로 일정 추가" : "음성으로 메모 추가"}</h2>
+    <div class="err" hidden></div>
+    <div class="voice-stage">
+      <div class="mic-orb" id="v-orb">🎙️</div>
+      <div class="voice-text" id="v-text"><span class="dim">듣고 있어요…</span></div>
+      <div class="voice-hint" id="v-hint">
+        ${
+          target === "event"
+            ? '예) "내일 오후 3시 지훈이 치과 예약"<br />"매주 토요일 재활용 쓰레기 배출"'
+            : '예) "우유 계란 사오기"<br />"현관 비밀번호 0417"'
+        }
+      </div>
+      <div id="v-preview"></div>
+      <button class="btn" id="v-confirm" data-action="voice-confirm"
+              data-target="${target}" hidden>이 내용으로 추가</button>
+      <button class="btn ghost" id="v-retry" data-action="voice-retry" hidden
+              style="margin-top:8px">다시 말하기</button>
+      <button class="btn ghost" id="v-manual" data-action="voice-manual"
+              data-target="${target}" hidden style="margin-top:8px">직접 입력으로 열기</button>
+    </div>
+  `, () => startListening(target));
+}
+
+let voiceResult = null;
+
+function startListening(target) {
+  const Rec = SpeechRec();
+  const orb = document.getElementById("v-orb");
+  const textEl = document.getElementById("v-text");
+  if (!Rec) return sheetError("이 브라우저는 음성 입력을 지원하지 않습니다.");
+
+  voiceResult = null;
+  document.getElementById("v-preview").innerHTML = "";
+  document.getElementById("v-confirm").hidden = true;
+  document.getElementById("v-retry").hidden = true;
+  document.getElementById("v-manual").hidden = true;
+  textEl.innerHTML = '<span class="dim">듣고 있어요…</span>';
+  orb.classList.add("listening");
+
+  stopListening();
+  recognizer = new Rec();
+  recognizer.lang = "ko-KR";
+  recognizer.interimResults = true;
+  recognizer.continuous = false;
+  recognizer.maxAlternatives = 1;
+
+  // 화면에 보이는 글자를 결과로 쓰면 오류 안내문까지 "말한 내용"으로 오인한다.
+  // 인식 결과는 별도 변수로만 추적한다.
+  let finalText = "";
+  let lastInterim = "";
+  let errored = false;
+
+  recognizer.onresult = (e) => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const chunk = e.results[i][0].transcript;
+      if (e.results[i].isFinal) finalText += chunk;
+      else interim += chunk;
+    }
+    if (interim.trim()) lastInterim = interim.trim();
+    const shown = (finalText + interim).trim();
+    if (shown) textEl.textContent = shown;
+  };
+
+  recognizer.onerror = (e) => {
+    errored = true;
+    orb.classList.remove("listening");
+    const msg =
+      e.error === "not-allowed" || e.error === "service-not-allowed"
+        ? "마이크 권한이 막혀 있습니다. 설정 → Safari → 마이크에서 허용해 주세요."
+        : e.error === "no-speech"
+          ? "소리가 들리지 않았어요. 다시 말해 주세요."
+          : "음성 인식에 실패했어요. 직접 입력해 주세요.";
+    textEl.innerHTML = `<span class="dim">${esc(msg)}</span>`;
+    document.getElementById("v-retry").hidden = false;
+    document.getElementById("v-manual").hidden = false;
+  };
+
+  recognizer.onend = () => {
+    orb.classList.remove("listening");
+    // 오류로 끝났으면 onerror가 이미 안내를 띄웠다
+    if (errored) return;
+
+    const said = (finalText.trim() || lastInterim).trim();
+    if (!said) {
+      textEl.innerHTML = '<span class="dim">소리가 들리지 않았어요. 다시 말해 주세요.</span>';
+      document.getElementById("v-retry").hidden = false;
+      document.getElementById("v-manual").hidden = false;
+      return;
+    }
+    showVoiceResult(said, target);
+  };
+
+  try {
+    recognizer.start();
+  } catch {
+    orb.classList.remove("listening");
+    sheetError("음성 인식을 시작할 수 없습니다. 직접 입력해 주세요.");
+  }
+}
+
+function stopListening() {
+  if (!recognizer) return;
+  try {
+    recognizer.onresult = null;
+    recognizer.onend = null;
+    recognizer.onerror = null;
+    recognizer.abort();
+  } catch {
+    /* 이미 종료된 경우 무시 */
+  }
+  recognizer = null;
+}
+
+function showVoiceResult(said, target) {
+  const textEl = document.getElementById("v-text");
+  textEl.textContent = said;
+
+  if (target === "memo") {
+    voiceResult = { text: said };
+    document.getElementById("v-preview").innerHTML = `
+      <div class="parse-preview">
+        <div class="pp-title">${esc(said)}</div>
+        <div class="pp-tags"><span class="pp-tag">메모</span></div>
+      </div>`;
+  } else {
+    const parsed = parseKoreanSchedule(said, state.today);
+    voiceResult = parsed;
+    const tags = [];
+    if (parsed.date) {
+      tags.push(parsed.date === state.today ? "오늘" : dayTagLabel(parsed.date));
+    } else {
+      tags.push("오늘 (날짜 못 알아들음)");
+    }
+    tags.push(parsed.time ? timeTagLabel(parsed.time) : "종일");
+    if (parsed.repeat !== "none") tags.push(REPEAT_SHORT[parsed.repeat]);
+
+    document.getElementById("v-preview").innerHTML = `
+      <div class="parse-preview">
+        <div class="pp-title">${esc(parsed.title || said)}</div>
+        <div class="pp-tags">${tags.map((t) => `<span class="pp-tag">${esc(t)}</span>`).join("")}</div>
+      </div>`;
+  }
+
+  document.getElementById("v-hint").innerHTML =
+    "내용이 맞으면 추가하세요. 고칠 곳이 있으면 직접 입력으로 열 수 있어요.";
+  document.getElementById("v-confirm").hidden = false;
+  document.getElementById("v-retry").hidden = false;
+  document.getElementById("v-manual").hidden = false;
+}
+
+function dayTagLabel(date) {
+  const delta = Math.round(
+    (new Date(date + "T00:00:00Z") - new Date(state.today + "T00:00:00Z")) / 86400000,
+  );
+  if (delta === 0) return "오늘";
+  if (delta === 1) return "내일";
+  if (delta === 2) return "모레";
+  return shortDate(date);
+}
+
+function timeTagLabel(time) {
+  const t = splitTime(time);
+  return `${t.ampm} ${t.h}`;
 }
 
 /* ------------------------------ 시트 ------------------------------ */
@@ -445,6 +724,7 @@ function openSheet(html, afterOpen) {
 }
 
 function closeSheet() {
+  stopListening();
   sheetEl?.remove();
   sheetEl = null;
   document.body.style.overflow = "";
@@ -468,8 +748,9 @@ const REPEAT_LABELS = {
   yearly: "매년",
 };
 
-function eventSheet(ev) {
-  const editing = !!ev;
+function eventSheet(ev, opts = {}) {
+  // draft = 음성 인식 결과를 채워 넣은 새 일정 (수정이 아니다)
+  const editing = !!ev && !opts.draft;
   const today = state.today || todayISO();
   const date = ev?.date ?? today;
   const time = ev?.time ?? "";
@@ -480,8 +761,16 @@ function eventSheet(ev) {
 
     <div class="field">
       <label for="e-title">무슨 일정인가요?</label>
-      <input id="e-title" type="text" maxlength="120" value="${esc(ev?.title ?? "")}"
-             placeholder="예: 지훈이 치과 예약" />
+      <div class="row-2">
+        <input id="e-title" type="text" maxlength="120" value="${esc(ev?.title ?? "")}"
+               placeholder="예: 지훈이 치과 예약" />
+        ${
+          voiceSupported()
+            ? `<button class="fab-mic" data-action="mic-fill" data-field="e-title"
+                       style="flex:0 0 52px" aria-label="음성으로 입력">🎙️</button>`
+            : ""
+        }
+      </div>
     </div>
 
     <div class="field">
@@ -619,8 +908,8 @@ async function saveEvent(id) {
 
 /* ---------- 메모 추가/수정 ---------- */
 
-function memoSheet(memo) {
-  const editing = !!memo;
+function memoSheet(memo, opts = {}) {
+  const editing = !!memo && !opts.draft;
   openSheet(`
     <h2>${editing ? "메모 수정" : "메모 추가"}</h2>
     <div class="err" hidden></div>
@@ -628,6 +917,12 @@ function memoSheet(memo) {
       <label for="m-text">메모 내용</label>
       <textarea id="m-text" maxlength="300"
         placeholder="예: 우유 사오기 / 관리비 25일까지">${esc(memo?.text ?? "")}</textarea>
+      ${
+        voiceSupported()
+          ? `<button class="btn ghost" data-action="mic-fill" data-field="m-text"
+                     style="margin-top:9px">🎙️  음성으로 입력</button>`
+          : ""
+      }
     </div>
     ${memberField("m-member", memo?.member_id)}
     <div class="field">
@@ -663,6 +958,80 @@ async function saveMemo(id) {
   toast(id ? "메모를 수정했어요" : "메모를 추가했어요");
 }
 
+/* ---------- 홈 화면에 추가 안내 ---------- */
+
+function isStandalone() {
+  return (
+    window.matchMedia("(display-mode: standalone)").matches ||
+    window.navigator.standalone === true
+  );
+}
+
+function platformGuess() {
+  const ua = navigator.userAgent;
+  if (/iPad|iPhone|iPod/.test(ua) || (/Macintosh/.test(ua) && "ontouchend" in document)) {
+    return "ios";
+  }
+  if (/Android/.test(ua)) return "android";
+  return "desktop";
+}
+
+function installSheet() {
+  const p = platformGuess();
+
+  const ios = `
+    <div class="info-card">
+      <div class="k">아이폰 · 아이패드</div>
+      <p style="margin-top:10px">
+        1. 이 화면을 <b>Safari</b>로 열어주세요 (크롬·카톡 내부 브라우저는 안 됩니다)<br />
+        2. 아래쪽 <b>공유 버튼</b>
+           <span style="display:inline-block;transform:translateY(2px)">⬆️</span> 을 누르세요<br />
+        3. 목록을 내려서 <b>"홈 화면에 추가"</b>를 누르세요<br />
+        4. 오른쪽 위 <b>추가</b>를 누르면 끝입니다
+      </p>
+      <p style="margin-bottom:0">
+        홈 화면에 앱 아이콘이 생기고, 열면 주소창 없이 앱처럼 전체화면으로 켜집니다.
+      </p>
+    </div>`;
+
+  const android = `
+    <div class="info-card">
+      <div class="k">안드로이드</div>
+      <p style="margin-top:10px">
+        1. 이 화면을 <b>Chrome</b>으로 열어주세요<br />
+        2. 오른쪽 위 <b>⋮ 메뉴</b>를 누르세요<br />
+        3. <b>"앱 설치"</b> 또는 <b>"홈 화면에 추가"</b>를 누르세요
+      </p>
+      <p style="margin-bottom:0">화면 아래에 설치 안내 배너가 바로 뜨는 경우도 있습니다.</p>
+    </div>`;
+
+  openSheet(`
+    <h2>휴대폰에 앱으로 설치</h2>
+    <p class="lede">
+      앱스토어에는 없습니다. 이 앱은 <b>홈 화면에 추가</b>하는 방식이라
+      설치 심사도, 업데이트 다운로드도 필요하지 않습니다.
+    </p>
+    <div class="err" hidden></div>
+    ${
+      isStandalone()
+        ? `<div class="info-card"><div class="k">설치 완료</div>
+             <p style="margin-top:10px;margin-bottom:0">
+               이미 홈 화면 앱으로 실행 중입니다. 추가로 할 일이 없어요.</p></div>`
+        : ""
+    }
+    ${p === "android" ? android + ios : ios + android}
+    <div class="info-card">
+      <div class="k">가족에게 보낼 때</div>
+      <p style="margin-top:10px;margin-bottom:0">
+        이 주소와 <b>초대 코드 · 공용 PIN</b>을 함께 보내주세요.
+        가족은 주소를 열고 "초대 코드로 참여하기"를 누르면 됩니다.
+      </p>
+      <button class="btn ghost" data-action="copy-url" style="margin-top:12px">
+        앱 주소 복사</button>
+    </div>
+  `);
+}
+
 /* ---------- 설정 ---------- */
 
 function settingsSheet() {
@@ -682,6 +1051,15 @@ function settingsSheet() {
       </div>
       <p>개인 PIN으로 로그인한 상태입니다. 다른 가족이 이 기기를 쓴다면 프로필을 전환하세요.</p>
       <button class="btn ghost" data-action="switch-profile">프로필 전환</button>
+    </div>
+
+    <div class="info-card">
+      <div class="k">휴대폰에 앱으로 설치</div>
+      <p style="margin-top:10px">
+        홈 화면에 추가하면 주소창 없이 앱처럼 켜집니다.
+        ${isStandalone() ? "<b>현재 앱으로 실행 중입니다.</b>" : ""}
+      </p>
+      <button class="btn ghost" data-action="install-guide">설치 방법 보기</button>
     </div>
 
     <div class="info-card">
@@ -823,6 +1201,76 @@ document.addEventListener("click", async (e) => {
       case "new-event": return eventSheet(null);
       case "new-memo": return memoSheet(null);
 
+      case "voice": return voiceSheet();
+      case "voice-retry": {
+        stopListening();
+        return startListening(el.closest(".sheet").querySelector("[data-target]").dataset.target);
+      }
+      case "voice-manual": {
+        const t = el.dataset.target;
+        const v = voiceResult;
+        closeSheet();
+        if (t === "memo") return memoSheet({ text: v?.text ?? "" }, { draft: true });
+        return eventSheet(
+          {
+            title: v?.title ?? "",
+            date: v?.date ?? state.today,
+            time: v?.time ?? null,
+            repeat: v?.repeat ?? "none",
+          },
+          { draft: true },
+        );
+      }
+      case "voice-confirm": {
+        const t = el.dataset.target;
+        if (!voiceResult) return;
+        if (t === "memo") {
+          if (!voiceResult.text) return sheetError("내용을 알아듣지 못했어요.");
+          await api("/memos", { method: "POST", body: { text: voiceResult.text } });
+        } else {
+          const title = voiceResult.title || "";
+          if (!title) return sheetError("일정 내용을 알아듣지 못했어요. 다시 말해 주세요.");
+          await api("/events", {
+            method: "POST",
+            body: {
+              title,
+              date: voiceResult.date ?? state.today,
+              time: voiceResult.time ?? null,
+              repeat: voiceResult.repeat ?? "none",
+            },
+          });
+        }
+        closeSheet();
+        await refresh();
+        return toast(t === "memo" ? "메모를 추가했어요" : "일정을 추가했어요");
+      }
+
+      case "install-guide": return installSheet();
+      case "mic-fill": {
+        // 폼 안에서 제목 칸을 음성으로 채운다
+        const Rec = SpeechRec();
+        if (!Rec) return toast("이 브라우저는 음성 입력을 지원하지 않습니다.");
+        const field = document.getElementById(el.dataset.field);
+        if (!field) return;
+        stopListening();
+        recognizer = new Rec();
+        recognizer.lang = "ko-KR";
+        recognizer.interimResults = true;
+        el.textContent = "●";
+        recognizer.onresult = (e) => {
+          let out = "";
+          for (let i = 0; i < e.results.length; i++) out += e.results[i][0].transcript;
+          field.value = out.trim();
+        };
+        recognizer.onend = () => { el.textContent = "🎙️"; };
+        recognizer.onerror = () => {
+          el.textContent = "🎙️";
+          toast("음성 인식에 실패했어요.");
+        };
+        try { recognizer.start(); } catch { el.textContent = "🎙️"; }
+        return;
+      }
+
       case "open-event": {
         const ev = state.events.find((x) => x.id === id);
         return ev && eventSheet(ev);
@@ -904,6 +1352,7 @@ document.addEventListener("click", async (e) => {
       case "copy-my-widget":
         return copy(`${location.origin}/api/widget/${state.me.widgetToken}`, "내 위젯 주소");
 
+      case "copy-url": return copy(location.origin, "앱 주소");
       case "copy-code": return copy(state.family.joinCode, "초대 코드");
       case "copy-widget":
         return copy(`${location.origin}/api/widget/${state.family.widgetToken}`, "위젯 주소");

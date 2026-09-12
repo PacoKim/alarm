@@ -861,7 +861,8 @@ const SECURITY_HEADERS: Record<string, string> = {
   "referrer-policy": "no-referrer",
   "cross-origin-opener-policy": "same-origin",
   "x-robots-tag": "noindex, nofollow",
-  "permissions-policy": "geolocation=(), camera=(), microphone=()",
+  // 음성으로 일정을 추가하므로 같은 출처에서는 마이크를 허용해야 한다
+  "permissions-policy": "geolocation=(), camera=(), microphone=(self)",
   "strict-transport-security": "max-age=31536000; includeSubDomains",
 };
 

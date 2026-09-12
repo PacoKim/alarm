@@ -1,10 +1,11 @@
 // 앱 껍데기만 캐시한다. API 응답은 항상 네트워크에서 받아 최신 일정을 보장한다.
-const CACHE = "family-reminder-v1";
+const CACHE = "family-reminder-v2";
 const SHELL = [
   "/",
   "/index.html",
   "/style.css",
   "/app.js",
+  "/nlp.js",
   "/manifest.webmanifest",
   "/icons/icon-192.png",
   "/icons/apple-touch-icon.png",
