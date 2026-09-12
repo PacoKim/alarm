@@ -4,10 +4,12 @@ import {
   hashPin,
   makeJoinCode,
   randomId,
+  secretEquals,
   signToken,
   verifyPin,
   verifyToken,
 } from "./auth";
+import { rateLimit, sweepRateLimits } from "./ratelimit";
 import {
   addDays,
   dayLabel,
@@ -22,9 +24,11 @@ export interface Env {
   DB: D1Database;
   ASSETS: Fetcher;
   AUTH_SECRET: string;
+  /** 가족 공간 생성에 필요한 설치 코드. 없으면 생성 자체가 잠긴다. */
+  SIGNUP_CODE?: string;
 }
 
-type Vars = { familyId: string };
+type Vars = { familyId: string; memberId: string | null };
 
 const app = new Hono<{ Bindings: Env; Variables: Vars }>();
 
@@ -32,6 +36,7 @@ const app = new Hono<{ Bindings: Env; Variables: Vars }>();
 
 const MEMBER_COLORS = ["#4f7cff", "#ff6b6b", "#2bb673", "#f59f00", "#a855f7", "#0ea5e9"];
 const REPEATS = new Set(["none", "daily", "weekly", "monthly", "yearly"]);
+const VISIBILITIES = new Set(["family", "private"]);
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const PIN_RE = /^\d{4,8}$/;
@@ -44,6 +49,27 @@ class HttpError extends Error {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function clientIp(c: any): string {
+  return (
+    c.req.header("cf-connecting-ip") ??
+    c.req.header("x-forwarded-for")?.split(",")[0].trim() ??
+    "unknown"
+  );
+}
+
+/** 제한을 넘으면 429로 막는다 */
+async function guard(c: any, scope: string, limit: number, windowSec: number) {
+  const res = await rateLimit(c.env.DB, scope, clientIp(c), limit, windowSec);
+  await sweepRateLimits(c.env.DB);
+  if (!res.ok) {
+    const mins = Math.ceil(res.retryAfter / 60);
+    throw new HttpError(
+      429,
+      `요청이 너무 많습니다. ${mins <= 1 ? "잠시" : mins + "분"} 후 다시 시도해 주세요.`,
+    );
+  }
 }
 
 function str(v: unknown, field: string, max: number, required = true): string | null {
@@ -80,21 +106,58 @@ app.onError((err, c) => {
 
 /* ------------------------------ 인증 미들웨어 ------------------------------ */
 
+/** 가족 공간에 들어온 것까지만 확인한다 (구성원 선택 전 단계에서 사용) */
 async function requireFamily(c: any, next: () => Promise<void>) {
   const header = c.req.header("authorization") ?? "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
   if (!token) throw new HttpError(401, "로그인이 필요합니다.");
   if (!c.env.AUTH_SECRET) throw new HttpError(403, "서버에 AUTH_SECRET이 설정되지 않았습니다.");
-  const familyId = await verifyToken(token, c.env.AUTH_SECRET);
-  if (!familyId) throw new HttpError(401, "세션이 만료되었습니다. 다시 로그인해 주세요.");
-  c.set("familyId", familyId);
+  const session = await verifyToken(token, c.env.AUTH_SECRET);
+  if (!session) throw new HttpError(401, "세션이 만료되었습니다. 다시 로그인해 주세요.");
+  c.set("familyId", session.familyId);
+  c.set("memberId", session.memberId);
+  await next();
+}
+
+/**
+ * "내가 누구인지"까지 확정된 세션만 통과시킨다.
+ * 개인 전용 항목을 가려내려면 반드시 구성원 신원이 필요하다.
+ */
+async function requireMember(c: any, next: () => Promise<void>) {
+  await requireFamily(c, async () => {});
+  const memberId = c.get("memberId");
+  if (!memberId) throw new HttpError(403, "내 프로필을 먼저 선택해 주세요.");
+
+  // 프로필이 삭제되었을 수 있으므로 실제 존재를 확인한다
+  const row = await c.env.DB.prepare(
+    `SELECT id FROM members WHERE id = ? AND family_id = ?`,
+  )
+    .bind(memberId, c.get("familyId"))
+    .first();
+  if (!row) throw new HttpError(401, "프로필을 찾을 수 없습니다. 다시 로그인해 주세요.");
+
   await next();
 }
 
 /* ------------------------------ 가족 생성 / 참여 ------------------------------ */
 
 app.post("/api/family/create", async (c) => {
+  // 같은 IP에서 1시간에 5번까지만 생성 시도 가능
+  await guard(c, "create", 5, 3600);
+
   const body = await c.req.json().catch(() => ({}));
+
+  // 설치 코드가 서버에 없으면 생성 기능 자체를 잠근다 (fail closed)
+  if (!c.env.SIGNUP_CODE) {
+    throw new HttpError(
+      403,
+      "가족 공간 생성이 잠겨 있습니다. 서버 관리자가 SIGNUP_CODE를 설정해야 합니다.",
+    );
+  }
+  if (!(await secretEquals(str(body.signupCode, "설치 코드", 200, false), c.env.SIGNUP_CODE))) {
+    throw new HttpError(401, "설치 코드가 올바르지 않습니다.");
+  }
+
   const name = str(body.name, "가족 이름", 40)!;
   const pin = str(body.pin, "PIN", 8)!;
   if (!PIN_RE.test(pin)) throw new HttpError(400, "PIN은 숫자 4~8자리로 만들어 주세요.");
@@ -138,13 +201,25 @@ app.post("/api/family/create", async (c) => {
     );
   if (stmts.length) await c.env.DB.batch(stmts);
 
+  const created_members = await c.env.DB.prepare(
+    `SELECT id, name, color, (pin_hash IS NOT NULL) AS claimed
+     FROM members WHERE family_id = ? ORDER BY sort_order`,
+  )
+    .bind(id)
+    .all();
+
   return c.json({
-    token: await signToken(id, c.env.AUTH_SECRET),
+    // 아직 "내가 누구인지"는 고르지 않은 상태의 토큰
+    token: await signToken({ familyId: id, memberId: null }, c.env.AUTH_SECRET),
     family: { id, name, joinCode, widgetToken },
+    members: created_members.results ?? [],
   });
 });
 
 app.post("/api/family/join", async (c) => {
+  // 초대 코드를 바꿔가며 찍어보는 시도를 막는다: 1분에 10회
+  await guard(c, "join", 10, 60);
+
   const body = await c.req.json().catch(() => ({}));
   const code = str(body.joinCode, "초대 코드", 12)!.toUpperCase();
   const pin = str(body.pin, "PIN", 8)!;
@@ -187,16 +262,105 @@ app.post("/api/family/join", async (c) => {
     .bind(row.id)
     .run();
 
+  const roster = await c.env.DB.prepare(
+    `SELECT id, name, color, (pin_hash IS NOT NULL) AS claimed
+     FROM members WHERE family_id = ? ORDER BY sort_order, created_at`,
+  )
+    .bind(row.id)
+    .all();
+
   return c.json({
-    token: await signToken(row.id, c.env.AUTH_SECRET),
+    token: await signToken({ familyId: row.id, memberId: null }, c.env.AUTH_SECRET),
     family: { id: row.id, name: row.name, joinCode: row.join_code, widgetToken: row.widget_token },
+    members: roster.results ?? [],
+  });
+});
+
+/* ------------------------------ 내 프로필 선택 (구성원 로그인) ------------------------------ */
+
+/** 가족 공간에 들어온 뒤 "나는 누구인가"를 확정한다 */
+app.get("/api/members/roster", requireFamily, async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT id, name, color, (pin_hash IS NOT NULL) AS claimed
+     FROM members WHERE family_id = ? ORDER BY sort_order, created_at`,
+  )
+    .bind(c.get("familyId"))
+    .all();
+  return c.json({ members: rows.results ?? [] });
+});
+
+/**
+ * 프로필 차지하기 / 프로필 로그인.
+ * 아직 주인이 없는 프로필이면 입력한 PIN이 그 사람의 개인 PIN으로 설정된다.
+ * 이미 주인이 있으면 개인 PIN이 맞아야 통과한다.
+ */
+app.post("/api/members/claim", requireFamily, async (c) => {
+  await guard(c, "claim", 12, 60);
+
+  const familyId = c.get("familyId");
+  const body = await c.req.json().catch(() => ({}));
+  const memberId = str(body.memberId, "구성원", 40)!;
+  const pin = str(body.pin, "개인 PIN", 8)!;
+  if (!PIN_RE.test(pin)) throw new HttpError(400, "개인 PIN은 숫자 4~8자리로 만들어 주세요.");
+
+  const member = await c.env.DB.prepare(
+    `SELECT id, name, color, pin_hash, widget_token, fail_count, locked_until
+     FROM members WHERE id = ? AND family_id = ?`,
+  )
+    .bind(memberId, familyId)
+    .first<{
+      id: string;
+      name: string;
+      color: string;
+      pin_hash: string | null;
+      widget_token: string | null;
+      fail_count: number;
+      locked_until: string | null;
+    }>();
+  if (!member) throw new HttpError(404, "구성원을 찾을 수 없습니다.");
+
+  if (member.locked_until && member.locked_until > nowIso()) {
+    throw new HttpError(429, "개인 PIN을 여러 번 틀렸습니다. 5분 후 다시 시도해 주세요.");
+  }
+
+  const widgetToken = member.widget_token ?? randomId(24);
+
+  if (!member.pin_hash) {
+    // 아직 주인이 없는 프로필 → 지금 입력한 PIN이 개인 PIN이 된다
+    await c.env.DB.prepare(
+      `UPDATE members SET pin_hash = ?, widget_token = ?, claimed_at = ? WHERE id = ?`,
+    )
+      .bind(await hashPin(pin), widgetToken, nowIso(), member.id)
+      .run();
+  } else {
+    if (!(await verifyPin(pin, member.pin_hash))) {
+      const fails = member.fail_count + 1;
+      const lockUntil = fails >= 5 ? new Date(Date.now() + 5 * 60_000).toISOString() : null;
+      await c.env.DB.prepare(
+        `UPDATE members SET fail_count = ?, locked_until = ? WHERE id = ?`,
+      )
+        .bind(lockUntil ? 0 : fails, lockUntil, member.id)
+        .run();
+      throw new HttpError(401, "개인 PIN이 올바르지 않습니다.");
+    }
+    await c.env.DB.prepare(
+      `UPDATE members SET fail_count = 0, locked_until = NULL, widget_token = ? WHERE id = ?`,
+    )
+      .bind(widgetToken, member.id)
+      .run();
+  }
+
+  return c.json({
+    token: await signToken({ familyId, memberId: member.id }, c.env.AUTH_SECRET),
+    me: { id: member.id, name: member.name, color: member.color, widgetToken },
   });
 });
 
 /* ------------------------------ 전체 상태 조회 ------------------------------ */
 
-app.get("/api/state", requireFamily, async (c) => {
+app.get("/api/state", requireMember, async (c) => {
   const familyId = c.get("familyId");
+  const me = c.get("memberId")!;
   const today = todayKST();
   const from = addDays(today, -1);
   const to = addDays(today, 120);
@@ -206,22 +370,29 @@ app.get("/api/state", requireFamily, async (c) => {
       .bind(familyId)
       .first<{ id: string; name: string; join_code: string; widget_token: string }>(),
     c.env.DB.prepare(
-      `SELECT id, name, color FROM members WHERE family_id = ? ORDER BY sort_order, created_at`,
+      `SELECT id, name, color, (pin_hash IS NOT NULL) AS claimed
+       FROM members WHERE family_id = ? ORDER BY sort_order, created_at`,
     )
       .bind(familyId)
-      .all<{ id: string; name: string; color: string }>(),
+      .all<{ id: string; name: string; color: string; claimed: number }>(),
+    // 개인 전용 항목은 만든 사람에게만 보인다
     c.env.DB.prepare(
-      `SELECT id, title, date, time, end_time, location, notes, member_id, repeat, repeat_until
+      `SELECT id, title, date, time, end_time, location, notes, member_id, repeat, repeat_until,
+              owner_id, visibility
        FROM events
-       WHERE family_id = ? AND (repeat != 'none' OR date >= ?)`,
+       WHERE family_id = ?
+         AND (visibility = 'family' OR owner_id = ?)
+         AND (repeat != 'none' OR date >= ?)`,
     )
-      .bind(familyId, from)
+      .bind(familyId, me, from)
       .all<EventRow>(),
     c.env.DB.prepare(
-      `SELECT id, text, pinned, done, member_id, created_at, updated_at
-       FROM memos WHERE family_id = ? ORDER BY done, pinned DESC, created_at DESC`,
+      `SELECT id, text, pinned, done, member_id, owner_id, visibility, created_at, updated_at
+       FROM memos
+       WHERE family_id = ? AND (visibility = 'family' OR owner_id = ?)
+       ORDER BY done, pinned DESC, created_at DESC`,
     )
-      .bind(familyId)
+      .bind(familyId, me)
       .all(),
   ]);
 
@@ -234,12 +405,26 @@ app.get("/api/state", requireFamily, async (c) => {
     timeLabel: timeLabel(o.time),
   }));
 
+  const meRow = (members.results ?? []).find((m) => m.id === me);
+  const myWidget = await c.env.DB.prepare(
+    `SELECT widget_token FROM members WHERE id = ?`,
+  )
+    .bind(me)
+    .first<{ widget_token: string | null }>();
+
   return c.json({
     family: {
       id: family.id,
       name: family.name,
       joinCode: family.join_code,
       widgetToken: family.widget_token,
+    },
+    me: {
+      id: me,
+      name: meRow?.name ?? null,
+      color: meRow?.color ?? null,
+      // 내 개인 항목까지 보이는 개인 위젯 주소
+      widgetToken: myWidget?.widget_token ?? null,
     },
     today,
     members: members.results ?? [],
@@ -250,6 +435,8 @@ app.get("/api/state", requireFamily, async (c) => {
 
 /* ------------------------------ 구성원 ------------------------------ */
 
+// 프로필 선택 화면에서 아직 목록에 없는 자기 이름을 추가할 수 있어야 하므로
+// 구성원 확정 전(가족 PIN만 통과한 상태)에도 허용한다.
 app.post("/api/members", requireFamily, async (c) => {
   const familyId = c.get("familyId");
   const body = await c.req.json().catch(() => ({}));
@@ -274,15 +461,70 @@ app.post("/api/members", requireFamily, async (c) => {
   return c.json({ member: { id, name, color } });
 });
 
-app.delete("/api/members/:id", requireFamily, async (c) => {
-  const res = await c.env.DB.prepare(`DELETE FROM members WHERE id = ? AND family_id = ?`)
-    .bind(c.req.param("id"), c.get("familyId"))
-    .run();
-  if (!res.meta.changes) throw new HttpError(404, "구성원을 찾을 수 없습니다.");
+app.delete("/api/members/:id", requireMember, async (c) => {
+  const familyId = c.get("familyId");
+  const me = c.get("memberId")!;
+  const target = c.req.param("id");
+
+  const row = await c.env.DB.prepare(
+    `SELECT id, name, pin_hash FROM members WHERE id = ? AND family_id = ?`,
+  )
+    .bind(target, familyId)
+    .first<{ id: string; name: string; pin_hash: string | null }>();
+  if (!row) throw new HttpError(404, "구성원을 찾을 수 없습니다.");
+
+  // 이미 주인이 있는 프로필은 본인만 지울 수 있다.
+  // 남이 지워버리면 그 사람의 개인 항목이 통째로 사라지기 때문이다.
+  if (row.pin_hash && row.id !== me) {
+    throw new HttpError(403, `${row.name} 님의 프로필은 본인만 삭제할 수 있습니다.`);
+  }
+
+  // 프로필이 사라지면 그 사람의 개인 항목도 볼 사람이 없으므로 함께 정리한다
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `DELETE FROM events WHERE family_id = ? AND visibility = 'private' AND owner_id = ?`,
+    ).bind(familyId, target),
+    c.env.DB.prepare(
+      `DELETE FROM memos WHERE family_id = ? AND visibility = 'private' AND owner_id = ?`,
+    ).bind(familyId, target),
+    c.env.DB.prepare(`DELETE FROM members WHERE id = ? AND family_id = ?`).bind(target, familyId),
+  ]);
+
   return c.json({ ok: true });
 });
 
 /* ------------------------------ 일정 ------------------------------ */
+
+/**
+ * 대상 항목을 내가 건드릴 수 있는지 확인한다.
+ * 개인 전용 항목은 만든 사람만 열람·수정·삭제할 수 있고,
+ * 남의 개인 항목에는 "없음"(404)으로 답해 존재 자체를 숨긴다.
+ */
+async function assertCanEdit(
+  db: D1Database,
+  table: "events" | "memos",
+  id: string,
+  familyId: string,
+  me: string,
+): Promise<void> {
+  const row = await db
+    .prepare(`SELECT owner_id, visibility FROM ${table} WHERE id = ? AND family_id = ?`)
+    .bind(id, familyId)
+    .first<{ owner_id: string | null; visibility: string }>();
+
+  // 남의 개인 항목도 "없음"으로 답해 존재를 노출하지 않는다
+  const notFound = table === "events" ? "일정을 찾을 수 없습니다." : "메모를 찾을 수 없습니다.";
+  if (!row) throw new HttpError(404, notFound);
+  if (row.visibility === "private" && row.owner_id !== me) {
+    throw new HttpError(404, notFound);
+  }
+}
+
+function visibilityField(v: unknown): string {
+  const raw = str(v, "공개 범위", 10, false) ?? "family";
+  if (!VISIBILITIES.has(raw)) throw new HttpError(400, "공개 범위 설정이 올바르지 않습니다.");
+  return raw;
+}
 
 async function assertMember(db: D1Database, familyId: string, memberId: string | null) {
   if (!memberId) return null;
@@ -294,10 +536,12 @@ async function assertMember(db: D1Database, familyId: string, memberId: string |
   return memberId;
 }
 
-app.post("/api/events", requireFamily, async (c) => {
+app.post("/api/events", requireMember, async (c) => {
   const familyId = c.get("familyId");
+  const me = c.get("memberId")!;
   const body = await c.req.json().catch(() => ({}));
 
+  const visibility = visibilityField(body.visibility);
   const title = str(body.title, "일정 내용", 120)!;
   const date = dateField(body.date, "날짜")!;
   const time = timeField(body.time, "시간");
@@ -319,26 +563,24 @@ app.post("/api/events", requireFamily, async (c) => {
   const ts = nowIso();
   await c.env.DB.prepare(
     `INSERT INTO events
-       (id, family_id, title, date, time, end_time, location, notes, member_id, repeat, repeat_until, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, family_id, title, date, time, end_time, location, notes, member_id,
+        repeat, repeat_until, owner_id, visibility, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, familyId, title, date, time, endTime, location, notes, memberId, repeat, repeatUntil, ts, ts)
+    .bind(id, familyId, title, date, time, endTime, location, notes, memberId,
+          repeat, repeatUntil, me, visibility, ts, ts)
     .run();
 
   return c.json({ id });
 });
 
-app.patch("/api/events/:id", requireFamily, async (c) => {
+app.patch("/api/events/:id", requireMember, async (c) => {
   const familyId = c.get("familyId");
+  const me = c.get("memberId")!;
   const id = c.req.param("id");
   const body = await c.req.json().catch(() => ({}));
 
-  const existing = await c.env.DB.prepare(
-    `SELECT id FROM events WHERE id = ? AND family_id = ?`,
-  )
-    .bind(id, familyId)
-    .first();
-  if (!existing) throw new HttpError(404, "일정을 찾을 수 없습니다.");
+  await assertCanEdit(c.env.DB, "events", id, familyId, me);
 
   const sets: string[] = [];
   const args: (string | null)[] = [];
@@ -362,6 +604,11 @@ app.patch("/api/events/:id", requireFamily, async (c) => {
     put("repeat", repeat);
   }
   if ("repeatUntil" in body) put("repeat_until", dateField(body.repeatUntil, "반복 종료일", false));
+  if ("visibility" in body) {
+    put("visibility", visibilityField(body.visibility));
+    // 공유였던 항목을 개인 전용으로 바꾸면 지금 바꾼 사람이 주인이 된다
+    put("owner_id", me);
+  }
 
   if (!sets.length) throw new HttpError(400, "변경할 내용이 없습니다.");
   put("updated_at", nowIso());
@@ -373,19 +620,24 @@ app.patch("/api/events/:id", requireFamily, async (c) => {
   return c.json({ ok: true });
 });
 
-app.delete("/api/events/:id", requireFamily, async (c) => {
-  const res = await c.env.DB.prepare(`DELETE FROM events WHERE id = ? AND family_id = ?`)
-    .bind(c.req.param("id"), c.get("familyId"))
+app.delete("/api/events/:id", requireMember, async (c) => {
+  const id = c.req.param("id");
+  const familyId = c.get("familyId");
+  await assertCanEdit(c.env.DB, "events", id, familyId, c.get("memberId")!);
+
+  await c.env.DB.prepare(`DELETE FROM events WHERE id = ? AND family_id = ?`)
+    .bind(id, familyId)
     .run();
-  if (!res.meta.changes) throw new HttpError(404, "일정을 찾을 수 없습니다.");
   return c.json({ ok: true });
 });
 
 /* ------------------------------ 메모 ------------------------------ */
 
-app.post("/api/memos", requireFamily, async (c) => {
+app.post("/api/memos", requireMember, async (c) => {
   const familyId = c.get("familyId");
+  const me = c.get("memberId")!;
   const body = await c.req.json().catch(() => ({}));
+  const visibility = visibilityField(body.visibility);
   const text = str(body.text, "메모 내용", 300)!;
   const memberId = await assertMember(c.env.DB, familyId, str(body.memberId, "담당", 40, false));
   const pinned = body.pinned ? 1 : 0;
@@ -393,24 +645,23 @@ app.post("/api/memos", requireFamily, async (c) => {
   const id = randomId();
   const ts = nowIso();
   await c.env.DB.prepare(
-    `INSERT INTO memos (id, family_id, text, pinned, done, member_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
+    `INSERT INTO memos
+       (id, family_id, text, pinned, done, member_id, owner_id, visibility, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, familyId, text, pinned, memberId, ts, ts)
+    .bind(id, familyId, text, pinned, memberId, me, visibility, ts, ts)
     .run();
 
   return c.json({ id });
 });
 
-app.patch("/api/memos/:id", requireFamily, async (c) => {
+app.patch("/api/memos/:id", requireMember, async (c) => {
   const familyId = c.get("familyId");
+  const me = c.get("memberId")!;
   const id = c.req.param("id");
   const body = await c.req.json().catch(() => ({}));
 
-  const existing = await c.env.DB.prepare(`SELECT id FROM memos WHERE id = ? AND family_id = ?`)
-    .bind(id, familyId)
-    .first();
-  if (!existing) throw new HttpError(404, "메모를 찾을 수 없습니다.");
+  await assertCanEdit(c.env.DB, "memos", id, familyId, me);
 
   const sets: string[] = [];
   const args: (string | number | null)[] = [];
@@ -431,6 +682,10 @@ app.patch("/api/memos/:id", requireFamily, async (c) => {
     sets.push("member_id = ?");
     args.push(await assertMember(c.env.DB, familyId, str(body.memberId, "담당", 40, false)));
   }
+  if ("visibility" in body) {
+    sets.push("visibility = ?", "owner_id = ?");
+    args.push(visibilityField(body.visibility), me);
+  }
   if (!sets.length) throw new HttpError(400, "변경할 내용이 없습니다.");
 
   sets.push("updated_at = ?");
@@ -443,11 +698,14 @@ app.patch("/api/memos/:id", requireFamily, async (c) => {
   return c.json({ ok: true });
 });
 
-app.delete("/api/memos/:id", requireFamily, async (c) => {
-  const res = await c.env.DB.prepare(`DELETE FROM memos WHERE id = ? AND family_id = ?`)
-    .bind(c.req.param("id"), c.get("familyId"))
+app.delete("/api/memos/:id", requireMember, async (c) => {
+  const id = c.req.param("id");
+  const familyId = c.get("familyId");
+  await assertCanEdit(c.env.DB, "memos", id, familyId, c.get("memberId")!);
+
+  await c.env.DB.prepare(`DELETE FROM memos WHERE id = ? AND family_id = ?`)
+    .bind(id, familyId)
     .run();
-  if (!res.meta.changes) throw new HttpError(404, "메모를 찾을 수 없습니다.");
   return c.json({ ok: true });
 });
 
@@ -456,31 +714,68 @@ app.delete("/api/memos/:id", requireFamily, async (c) => {
 app.use("/api/widget/*", cors({ origin: "*", allowMethods: ["GET"] }));
 
 app.get("/api/widget/:token", async (c) => {
+  // 정상 위젯은 15분 주기로 호출한다. 넉넉히 두되 토큰 대량 추측은 막는다.
+  await guard(c, "widget", 60, 60);
+
   const token = c.req.param("token");
-  const family = await c.env.DB.prepare(
-    `SELECT id, name FROM families WHERE widget_token = ?`,
+
+  // 토큰은 두 종류다.
+  //   구성원 토큰 → 가족 공유 항목 + 그 사람의 개인 항목
+  //   가족 토큰   → 가족 공유 항목만
+  const asMember = await c.env.DB.prepare(
+    `SELECT m.id AS member_id, m.name AS member_name, f.id AS family_id, f.name AS family_name
+     FROM members m JOIN families f ON f.id = m.family_id
+     WHERE m.widget_token = ?`,
   )
     .bind(token)
-    .first<{ id: string; name: string }>();
-  if (!family) throw new HttpError(404, "위젯 토큰이 올바르지 않습니다.");
+    .first<{ member_id: string; member_name: string; family_id: string; family_name: string }>();
+
+  let family: { id: string; name: string };
+  let viewerId: string | null = null;
+  let viewerName: string | null = null;
+
+  if (asMember) {
+    family = { id: asMember.family_id, name: asMember.family_name };
+    viewerId = asMember.member_id;
+    viewerName = asMember.member_name;
+  } else {
+    const asFamily = await c.env.DB.prepare(
+      `SELECT id, name FROM families WHERE widget_token = ?`,
+    )
+      .bind(token)
+      .first<{ id: string; name: string }>();
+    if (!asFamily) throw new HttpError(404, "위젯 토큰이 올바르지 않습니다.");
+    family = asFamily;
+  }
 
   const today = todayKST();
   const to = addDays(today, 21);
 
   const [events, memos, members] = await Promise.all([
     c.env.DB.prepare(
-      `SELECT id, title, date, time, end_time, location, notes, member_id, repeat, repeat_until
-       FROM events WHERE family_id = ? AND (repeat != 'none' OR date >= ?)`,
+      `SELECT id, title, date, time, end_time, location, notes, member_id, repeat, repeat_until,
+              owner_id, visibility
+       FROM events
+       WHERE family_id = ?
+         AND (visibility = 'family' OR owner_id = ?)
+         AND (repeat != 'none' OR date >= ?)`,
     )
-      .bind(family.id, today)
+      .bind(family.id, viewerId, today)
       .all<EventRow>(),
     c.env.DB.prepare(
-      `SELECT id, text, pinned, member_id FROM memos
-       WHERE family_id = ? AND done = 0
+      `SELECT id, text, pinned, member_id, owner_id, visibility FROM memos
+       WHERE family_id = ? AND done = 0 AND (visibility = 'family' OR owner_id = ?)
        ORDER BY pinned DESC, created_at DESC LIMIT 12`,
     )
-      .bind(family.id)
-      .all<{ id: string; text: string; pinned: number; member_id: string | null }>(),
+      .bind(family.id, viewerId)
+      .all<{
+        id: string;
+        text: string;
+        pinned: number;
+        member_id: string | null;
+        owner_id: string | null;
+        visibility: string;
+      }>(),
     c.env.DB.prepare(`SELECT id, name, color FROM members WHERE family_id = ?`)
       .bind(family.id)
       .all<{ id: string; name: string; color: string }>(),
@@ -498,6 +793,7 @@ app.get("/api/widget/:token", async (c) => {
       return {
         id: o.id,
         title: o.title,
+        private: o.visibility === "private",
         date: o.occurs_on,
         dayLabel: dayLabel(o.occurs_on, today),
         time: o.time,
@@ -512,6 +808,8 @@ app.get("/api/widget/:token", async (c) => {
   return c.json(
     {
       family: family.name,
+      // 개인 위젯이면 누구 것인지 알려준다 (위젯 제목에 활용)
+      viewer: viewerName,
       today,
       nowTime,
       updatedAt: nowIso(),
@@ -522,6 +820,7 @@ app.get("/api/widget/:token", async (c) => {
           id: m.id,
           text: m.text,
           pinned: !!m.pinned,
+          private: m.visibility === "private",
           member: who?.name ?? null,
           color: who?.color ?? null,
         };
@@ -536,12 +835,49 @@ app.get("/api/widget/:token", async (c) => {
 
 app.all("/api/*", (c) => c.json({ error: "요청한 API를 찾을 수 없습니다." }, 404));
 
-app.get("*", async (c) => {
+/** 검색엔진 색인 차단: 주소가 퍼져 모르는 사람이 찾아오는 것을 막는다 */
+app.get("/robots.txt", (c) =>
+  c.text("User-agent: *\nDisallow: /\n", 200, {
+    "cache-control": "public, max-age=3600",
+  }),
+);
+
+const SECURITY_HEADERS: Record<string, string> = {
+  // 앱은 자기 출처의 리소스만 쓴다. 외부 스크립트 주입을 차단한다.
+  "content-security-policy": [
+    "default-src 'self'",
+    "script-src 'self'",
+    // 화면 조립에 style 속성을 쓰므로 inline style만 허용 (script는 불허)
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "manifest-src 'self'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join("; "),
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "referrer-policy": "no-referrer",
+  "cross-origin-opener-policy": "same-origin",
+  "x-robots-tag": "noindex, nofollow",
+  "permissions-policy": "geolocation=(), camera=(), microphone=()",
+  "strict-transport-security": "max-age=31536000; includeSubDomains",
+};
+
+function withSecurityHeaders(res: Response): Response {
+  const out = new Response(res.body, res);
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) out.headers.set(k, v);
+  return out;
+}
+
+app.on(["GET", "HEAD"], "*", async (c) => {
   const res = await c.env.ASSETS.fetch(c.req.raw);
-  if (res.status !== 404) return res;
+  if (res.status !== 404) return withSecurityHeaders(res);
+
   const url = new URL(c.req.url);
   url.pathname = "/index.html";
-  return c.env.ASSETS.fetch(new Request(url, c.req.raw));
+  return withSecurityHeaders(await c.env.ASSETS.fetch(new Request(url, c.req.raw)));
 });
 
 export default app;

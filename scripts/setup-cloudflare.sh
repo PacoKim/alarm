@@ -73,9 +73,34 @@ else
   echo "   등록 완료 (값은 Cloudflare에만 저장됩니다)"
 fi
 
+echo "==> SIGNUP_CODE 등록 (가족 공간 생성 잠금)"
+SIGNUP_SHOWN=""
+if $WRANGLER secret list 2>/dev/null | grep -q SIGNUP_CODE; then
+  echo "   이미 등록되어 있어 건너뜁니다."
+  echo "   잊어버렸다면 새로 발급: npx wrangler secret put SIGNUP_CODE"
+else
+  SIGNUP=$(node -e "
+    const a='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const b=require('crypto').randomBytes(10);
+    console.log([...b].map(n=>a[n%a.length]).join('').replace(/(.{5})(?=.)/g,'\$1-'));
+  ")
+  printf '%s' "$SIGNUP" | $WRANGLER secret put SIGNUP_CODE
+  SIGNUP_SHOWN="$SIGNUP"
+fi
+
 echo "==> 배포"
 $WRANGLER deploy
 
 echo ""
+echo "────────────────────────────────────────────────────────"
+if [ -n "$SIGNUP_SHOWN" ]; then
+  echo "  설치 코드:  $SIGNUP_SHOWN"
+  echo ""
+  echo "  이 코드는 여기에만 표시됩니다. 지금 안전한 곳에 적어두세요."
+  echo "  가족 공간을 '만들 때'만 필요하고, 가족이 '참여할 때'는"
+  echo "  초대 코드와 공용 PIN만 있으면 됩니다."
+  echo "────────────────────────────────────────────────────────"
+  echo ""
+fi
 echo "완료! 위에 표시된 https://family-reminder.<계정>.workers.dev 주소를"
 echo "아이폰 Safari로 열어 '가족 공간 만들기'부터 시작하세요."

@@ -51,6 +51,21 @@ function timingSafeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+/**
+ * 길이까지 감추는 상수 시간 비교.
+ * 두 값을 각각 SHA-256으로 해싱한 뒤 비교하므로 길이가 달라도
+ * 비교 시간이 일정하고, 오답의 길이 정보가 새지 않는다.
+ */
+export async function secretEquals(a: string | null, b: string | null): Promise<boolean> {
+  if (!a || !b) return false;
+  const [ha, hb] = await Promise.all([sha256Hex(a), sha256Hex(b)]);
+  return timingSafeEqual(ha, hb);
+}
+
+async function sha256Hex(v: string): Promise<string> {
+  return toHex(await crypto.subtle.digest("SHA-256", enc.encode(v)));
+}
+
 /* ---------- 세션 토큰 (HMAC-SHA256) ---------- */
 
 function b64urlEncode(s: string): string {
@@ -72,22 +87,41 @@ async function hmac(payload: string, secret: string): Promise<string> {
   return toHex(await crypto.subtle.sign("HMAC", key, enc.encode(payload)));
 }
 
-/** 가족 공간에 대한 서명된 세션 토큰 발급 (기본 180일) */
-export async function signToken(familyId: string, secret: string, days = 180): Promise<string> {
+export interface Session {
+  familyId: string;
+  /** 구성원 프로필까지 로그인했으면 그 id, 가족 공간까지만 들어온 상태면 null */
+  memberId: string | null;
+}
+
+/**
+ * 서명된 세션 토큰 발급 (기본 180일).
+ * memberId가 없는 토큰은 "가족 공간에는 들어왔지만 내가 누군지는 아직 안 고른" 상태다.
+ */
+export async function signToken(
+  session: Session,
+  secret: string,
+  days = 180,
+): Promise<string> {
   const exp = Date.now() + days * 86_400_000;
-  const payload = b64urlEncode(JSON.stringify({ f: familyId, exp }));
+  const payload = b64urlEncode(
+    JSON.stringify({ f: session.familyId, m: session.memberId, exp }),
+  );
   return `${payload}.${await hmac(payload, secret)}`;
 }
 
-/** 토큰 검증. 유효하면 familyId, 아니면 null */
-export async function verifyToken(token: string, secret: string): Promise<string | null> {
+/** 토큰 검증. 유효하면 세션, 아니면 null */
+export async function verifyToken(token: string, secret: string): Promise<Session | null> {
   const [payload, sig] = token.split(".");
   if (!payload || !sig) return null;
   if (!timingSafeEqual(await hmac(payload, secret), sig)) return null;
   try {
-    const { f, exp } = JSON.parse(b64urlDecode(payload)) as { f: string; exp: number };
+    const { f, m, exp } = JSON.parse(b64urlDecode(payload)) as {
+      f: string;
+      m: string | null;
+      exp: number;
+    };
     if (!f || typeof exp !== "number" || Date.now() > exp) return null;
-    return f;
+    return { familyId: f, memberId: typeof m === "string" ? m : null };
   } catch {
     return null;
   }

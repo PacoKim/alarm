@@ -6,8 +6,12 @@ const root = document.getElementById("root");
 const state = {
   token: localStorage.getItem(TOKEN_KEY),
   loading: true,
+  /** onboard = 미로그인 · picker = 내 프로필 선택 대기 · app = 사용 중 */
+  stage: "onboard",
   tab: "events",
   family: null,
+  me: null,
+  roster: [],
   members: [],
   events: [],
   memos: [],
@@ -86,19 +90,48 @@ async function api(path, { method = "GET", body } = {}) {
     logout();
     throw new Error("세션이 만료되었습니다. 다시 로그인해 주세요.");
   }
-  if (!res.ok) throw new Error(data.error || "요청을 처리하지 못했습니다.");
+  if (!res.ok) {
+    const err = new Error(data.error || "요청을 처리하지 못했습니다.");
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
 async function refresh() {
-  const data = await api("/state");
-  Object.assign(state, data, { loading: false });
+  try {
+    const data = await api("/state");
+    Object.assign(state, data, { loading: false, stage: "app" });
+  } catch (err) {
+    // 가족 공간에는 들어왔지만 "내가 누구인지"를 아직 안 고른 상태
+    if (err.status === 403) {
+      await loadRoster();
+      state.stage = "picker";
+      state.loading = false;
+    } else {
+      throw err;
+    }
+  }
   render();
+}
+
+async function loadRoster() {
+  const { members } = await api("/members/roster");
+  state.roster = members;
 }
 
 function logout() {
   localStorage.removeItem(TOKEN_KEY);
-  Object.assign(state, { token: null, family: null, members: [], events: [], memos: [] });
+  Object.assign(state, {
+    token: null,
+    stage: "onboard",
+    family: null,
+    me: null,
+    roster: [],
+    members: [],
+    events: [],
+    memos: [],
+  });
   render();
 }
 
@@ -132,6 +165,14 @@ function createSheet() {
       <input id="f-pin" type="text" inputmode="numeric" autocomplete="off"
              placeholder="가족에게 알려줄 번호" maxlength="8" />
     </div>
+    <div class="field">
+      <label for="f-signup">설치 코드</label>
+      <input id="f-signup" type="password" autocomplete="off" maxlength="200"
+             placeholder="배포할 때 받은 코드" />
+      <p style="margin:8px 2px 0;font-size:12.5px;color:var(--text-dim);line-height:1.5">
+        서버를 설치한 사람만 아는 코드입니다. 가족이 <b>참여</b>할 때는 필요하지 않고,
+        새 가족 공간을 만들 때만 씁니다.</p>
+    </div>
     <button class="btn" data-action="do-create">만들기</button>
   `, () => document.getElementById("f-name")?.focus());
 }
@@ -155,12 +196,93 @@ function joinSheet() {
 
 /* ------------------------------ 메인 화면 ------------------------------ */
 
+function renderPicker() {
+  const claimed = state.roster.filter((m) => m.claimed);
+  const free = state.roster.filter((m) => !m.claimed);
+
+  const card = (m) => `
+    <button class="row" data-action="pick-profile" data-id="${esc(m.id)}"
+            data-name="${esc(m.name)}" data-claimed="${m.claimed ? "1" : "0"}">
+      <span class="when" style="flex:0 0 auto">
+        <span class="dot" style="display:inline-block;width:14px;height:14px;border-radius:50%;background:${esc(m.color)}"></span>
+      </span>
+      <span class="body">
+        <span class="title">${esc(m.name)}</span>
+        <span class="meta">${m.claimed ? "개인 PIN 입력" : "처음 로그인 · 개인 PIN을 새로 정합니다"}</span>
+      </span>
+    </button>`;
+
+  root.innerHTML = `
+    <div class="app">
+      <header class="topbar">
+        <h1>나는 누구인가요?
+          <span class="sub">${esc(state.familyName ?? "가족 공간")} · 내 일정과 개인 메모를 구분하기 위해 필요해요</span>
+        </h1>
+      </header>
+      <main>
+        ${
+          claimed.length
+            ? `<section class="day-group"><div class="day-head"><b>등록된 프로필</b></div>
+                 <div class="card">${claimed.map(card).join("")}</div></section>`
+            : ""
+        }
+        ${
+          free.length
+            ? `<section class="day-group"><div class="day-head"><b>아직 주인이 없는 프로필</b></div>
+                 <div class="card">${free.map(card).join("")}</div></section>`
+            : ""
+        }
+        ${
+          !state.roster.length
+            ? `<div class="empty"><div class="big">👋</div>
+                 <p>등록된 구성원이 없어요.<br />아래에서 내 이름을 추가해 주세요.</p></div>`
+            : ""
+        }
+        <section class="day-group">
+          <div class="day-head"><b>목록에 내 이름이 없나요?</b></div>
+          <div class="row-2">
+            <input id="p-newname" type="text" maxlength="20" placeholder="내 이름 입력" />
+            <button class="btn ghost" data-action="add-self" style="flex:0 0 90px">추가</button>
+          </div>
+        </section>
+      </main>
+      <div class="fab-bar">
+        <button class="fab ghost" data-action="logout"
+                style="background:var(--surface);color:var(--text);box-shadow:none;border:1px solid var(--line)">
+          다른 가족 공간으로 로그인
+        </button>
+      </div>
+    </div>`;
+}
+
+function profilePinSheet(id, name, claimed) {
+  openSheet(`
+    <h2>${esc(name)} 님으로 로그인</h2>
+    <div class="err" hidden></div>
+    ${
+      claimed
+        ? `<p style="margin:0 0 16px;font-size:14px;color:var(--text-dim);line-height:1.6">
+             ${esc(name)} 님이 정한 <b>개인 PIN</b>을 입력해 주세요.</p>`
+        : `<p style="margin:0 0 16px;font-size:14px;color:var(--text-dim);line-height:1.6">
+             이 프로필은 아직 주인이 없어요. 지금 입력하는 번호가
+             <b>${esc(name)} 님의 개인 PIN</b>이 됩니다. 가족 공용 PIN과 다르게 정해도 됩니다.</p>`
+    }
+    <div class="field">
+      <label for="p-pin">개인 PIN (숫자 4~8자리)</label>
+      <input id="p-pin" type="password" inputmode="numeric" autocomplete="off" maxlength="8" />
+    </div>
+    <button class="btn" data-action="do-claim" data-id="${esc(id)}">
+      ${claimed ? "로그인" : "이 프로필 사용하기"}</button>
+  `, () => document.getElementById("p-pin")?.focus());
+}
+
 function render() {
   if (!state.token) return renderOnboard();
   if (state.loading) {
     root.innerHTML = `<div class="spinner"></div>`;
     return;
   }
+  if (state.stage === "picker") return renderPicker();
 
   const openMemos = state.memos.filter((m) => !m.done).length;
   const todayCount = state.events.filter((e) => e.date === state.today).length;
@@ -169,7 +291,11 @@ function render() {
     <div class="app">
       <header class="topbar">
         <h1>${esc(state.family?.name ?? "우리가족")}
-          <span class="sub">${shortDate(state.today)} · 오늘 일정 ${todayCount}개</span>
+          <span class="sub">${
+            state.me?.name
+              ? `${esc(state.me.name)} 님 · `
+              : ""
+          }${shortDate(state.today)} · 오늘 일정 ${todayCount}개</span>
         </h1>
         <span class="spacer"></span>
         <button class="icon-btn" data-action="refresh" aria-label="새로 고침">↻</button>
@@ -199,6 +325,7 @@ const RELATIVE_LABELS = new Set(["오늘", "내일", "모레", "어제"]);
 /** 시간·장소·담당·반복을 있는 것만 " · "로 이어 붙인다 */
 function eventMeta(ev) {
   const parts = [];
+  if (ev.visibility === "private") parts.push('<span class="lock">🔒 나만</span>');
   if (ev.time) parts.push(esc(ev.timeLabel));
   if (ev.location) parts.push(esc(ev.location));
   const name = memberName(ev.member_id);
@@ -287,8 +414,15 @@ function memoRow(m) {
               aria-label="완료 표시">✓</button>
       <button class="body" style="background:none;border:none;padding:0;text-align:left"
               data-action="open-memo" data-id="${esc(m.id)}">
-        <span class="title">${m.pinned ? `<span class="pin">📌</span> ` : ""}${esc(m.text)}</span>
-        <span class="meta">${memberDot(memberColor(m.member_id), memberName(m.member_id))}</span>
+        <span class="title">${m.pinned ? `<span class="pin">📌</span> ` : ""}${
+          m.visibility === "private" ? `<span class="lock">🔒</span> ` : ""
+        }${esc(m.text)}</span>
+        <span class="meta">${[
+          m.visibility === "private" ? '<span class="lock">나만 보기</span>' : "",
+          memberDot(memberColor(m.member_id), memberName(m.member_id)),
+        ]
+          .filter(Boolean)
+          .join(' <span aria-hidden="true">·</span> ')}</span>
       </button>
     </div>`;
 }
@@ -373,6 +507,7 @@ function eventSheet(ev) {
     </div>
 
     ${memberField("e-member", ev?.member_id)}
+    ${visibilityField(ev?.visibility)}
 
     <details style="margin-bottom:16px">
       <summary style="font-size:14px;font-weight:600;color:var(--text-dim);padding:8px 0">
@@ -407,6 +542,24 @@ function eventSheet(ev) {
     syncChips();
     if (!editing) document.getElementById("e-title")?.focus();
   });
+}
+
+/** '나만 보기' 토글. 켜면 가족에게 안 보이고 내 위젯에만 나온다. */
+function visibilityField(visibility) {
+  const isPrivate = visibility === "private";
+  return `
+    <div class="field">
+      <button class="toggle-row" data-action="toggle-visibility" style="width:100%">
+        <span class="label"><b>나만 보기</b>
+          <span>가족에게는 보이지 않고 내 위젯에만 표시됩니다</span></span>
+        <span class="switch" data-role="visibility" aria-pressed="${isPrivate}"></span>
+      </button>
+    </div>`;
+}
+
+function pickedVisibility() {
+  const sw = sheetEl?.querySelector('[data-role="visibility"]');
+  return sw?.getAttribute("aria-pressed") === "true" ? "private" : "family";
 }
 
 function memberField(id, selected) {
@@ -451,6 +604,7 @@ async function saveEvent(id) {
     notes: document.getElementById("e-notes")?.value.trim() || null,
     repeat: document.getElementById("e-repeat")?.value || "none",
     memberId: pickedMember(),
+    visibility: pickedVisibility(),
   };
   if (!payload.title) return sheetError("일정 내용을 입력해 주세요.");
   if (!payload.date) return sheetError("날짜를 선택해 주세요.");
@@ -480,9 +634,10 @@ function memoSheet(memo) {
       <button class="toggle-row" data-action="toggle-pin" style="width:100%">
         <span class="label"><b>위젯에 고정</b>
           <span>잠금화면 위젯 맨 위에 항상 보여줍니다</span></span>
-        <span class="switch" aria-pressed="${!!memo?.pinned}"></span>
+        <span class="switch" data-role="pinned" aria-pressed="${!!memo?.pinned}"></span>
       </button>
     </div>
+    ${visibilityField(memo?.visibility)}
     <button class="btn" data-action="save-memo" data-id="${esc(memo?.id ?? "")}">
       ${editing ? "저장" : "추가"}</button>
     ${editing ? `<button class="btn danger" data-action="delete-memo" data-id="${esc(memo.id)}" style="margin-top:6px">이 메모 삭제</button>` : ""}
@@ -494,8 +649,10 @@ async function saveMemo(id) {
   if (!text) return sheetError("메모 내용을 입력해 주세요.");
   const payload = {
     text,
-    pinned: sheetEl.querySelector(".switch")?.getAttribute("aria-pressed") === "true",
+    pinned:
+      sheetEl.querySelector('[data-role="pinned"]')?.getAttribute("aria-pressed") === "true",
     memberId: pickedMember(),
+    visibility: pickedVisibility(),
   };
 
   if (id) await api(`/memos/${id}`, { method: "PATCH", body: payload });
@@ -509,10 +666,23 @@ async function saveMemo(id) {
 /* ---------- 설정 ---------- */
 
 function settingsSheet() {
-  const widgetUrl = `${location.origin}/api/widget/${state.family.widgetToken}`;
+  const myUrl = state.me?.widgetToken
+    ? `${location.origin}/api/widget/${state.me.widgetToken}`
+    : null;
+  const familyUrl = `${location.origin}/api/widget/${state.family.widgetToken}`;
   openSheet(`
     <h2>설정</h2>
     <div class="err" hidden></div>
+
+    <div class="info-card">
+      <div class="k">내 프로필</div>
+      <div style="display:flex;align-items:center;gap:9px;margin:8px 0 12px">
+        <span style="width:12px;height:12px;border-radius:50%;background:${esc(state.me?.color ?? "#888")}"></span>
+        <b style="font-size:17px">${esc(state.me?.name ?? "-")}</b>
+      </div>
+      <p>개인 PIN으로 로그인한 상태입니다. 다른 가족이 이 기기를 쓴다면 프로필을 전환하세요.</p>
+      <button class="btn ghost" data-action="switch-profile">프로필 전환</button>
+    </div>
 
     <div class="info-card">
       <div class="k">가족 초대 코드</div>
@@ -521,12 +691,25 @@ function settingsSheet() {
       <button class="btn ghost" data-action="copy-code">초대 코드 복사</button>
     </div>
 
+    ${
+      myUrl
+        ? `<div class="info-card">
+             <div class="k">내 위젯 주소 (읽기 전용)</div>
+             <code>${esc(myUrl)}</code>
+             <p><b>가족 공유 일정 + 내 개인 항목</b>이 함께 보입니다.
+                내 아이폰 위젯에는 이 주소를 넣으세요.
+                이 주소는 나만 쓰는 것이니 가족에게도 알려주지 마세요.</p>
+             <button class="btn ghost" data-action="copy-my-widget">내 위젯 주소 복사</button>
+           </div>`
+        : ""
+    }
+
     <div class="info-card">
-      <div class="k">위젯 주소 (읽기 전용)</div>
-      <code>${esc(widgetUrl)}</code>
-      <p>아이폰 Scriptable 위젯 설정에 이 주소를 넣으면 잠금화면·홈화면에 표시됩니다.
-         읽기만 가능하고 수정은 되지 않습니다.</p>
-      <button class="btn ghost" data-action="copy-widget">위젯 주소 복사</button>
+      <div class="k">가족 공용 위젯 주소 (읽기 전용)</div>
+      <code>${esc(familyUrl)}</code>
+      <p><b>가족 공유 일정만</b> 보입니다. 개인 항목은 나오지 않습니다.
+         거실 아이패드처럼 여러 사람이 함께 보는 기기에 쓰세요.</p>
+      <button class="btn ghost" data-action="copy-widget">공용 위젯 주소 복사</button>
     </div>
 
     <div class="info-card">
@@ -538,7 +721,8 @@ function settingsSheet() {
                 .map(
                   (m) => `<span class="member-tag">
                     <span class="dot" style="width:9px;height:9px;border-radius:50%;background:${esc(m.color)}"></span>
-                    ${esc(m.name)}
+                    ${esc(m.name)}${m.id === state.me?.id ? " (나)" : ""}
+                    ${m.claimed ? '<span title="개인 PIN 등록됨" style="font-size:11px">🔒</span>' : ""}
                     <button class="x" data-action="del-member" data-id="${esc(m.id)}"
                             aria-label="${esc(m.name)} 삭제">×</button></span>`,
                 )
@@ -597,15 +781,21 @@ document.addEventListener("click", async (e) => {
           .value.split(",")
           .map((s) => s.trim())
           .filter(Boolean);
+        const signupCode = document.getElementById("f-signup").value.trim();
         if (!name) return sheetError("가족 이름을 입력해 주세요.");
         if (!/^\d{4,8}$/.test(pin)) return sheetError("PIN은 숫자 4~8자리로 만들어 주세요.");
-        const res = await api("/family/create", { method: "POST", body: { name, pin, members } });
+        if (!signupCode) return sheetError("설치 코드를 입력해 주세요.");
+        const res = await api("/family/create", {
+          method: "POST",
+          body: { name, pin, members, signupCode },
+        });
         localStorage.setItem(TOKEN_KEY, res.token);
         state.token = res.token;
+        state.familyName = res.family.name;
+        state.joinCodeHint = res.family.joinCode;
         closeSheet();
         await refresh();
-        toast(`초대 코드 ${res.family.joinCode} 생성 완료`);
-        return settingsSheet();
+        return toast(`초대 코드 ${res.family.joinCode} · 이제 내 프로필을 골라주세요`);
       }
 
       case "do-join": {
@@ -615,6 +805,7 @@ document.addEventListener("click", async (e) => {
         const res = await api("/family/join", { method: "POST", body: { joinCode, pin } });
         localStorage.setItem(TOKEN_KEY, res.token);
         state.token = res.token;
+        state.familyName = res.family.name;
         closeSheet();
         return refresh();
       }
@@ -667,11 +858,51 @@ document.addEventListener("click", async (e) => {
         return api(`/memos/${id}`, { method: "PATCH", body: { done: !!m.done } }).then(refresh);
       }
 
-      case "toggle-pin": {
+      case "toggle-pin":
+      case "toggle-visibility": {
         const sw = el.querySelector(".switch");
         sw.setAttribute("aria-pressed", String(sw.getAttribute("aria-pressed") !== "true"));
         return;
       }
+
+      case "pick-profile":
+        return profilePinSheet(id, el.dataset.name, el.dataset.claimed === "1");
+
+      case "do-claim": {
+        const pin = document.getElementById("p-pin").value.trim();
+        if (!/^\d{4,8}$/.test(pin)) {
+          return sheetError("개인 PIN은 숫자 4~8자리로 입력해 주세요.");
+        }
+        const res = await api("/members/claim", {
+          method: "POST",
+          body: { memberId: id, pin },
+        });
+        localStorage.setItem(TOKEN_KEY, res.token);
+        state.token = res.token;
+        closeSheet();
+        await refresh();
+        return toast(`${res.me.name} 님으로 로그인했어요`);
+      }
+
+      case "add-self": {
+        const input = document.getElementById("p-newname");
+        const name = input.value.trim();
+        if (!name) return toast("이름을 입력해 주세요.");
+        await api("/members", { method: "POST", body: { name } });
+        input.value = "";
+        await loadRoster();
+        return render();
+      }
+
+      case "switch-profile": {
+        closeSheet();
+        await loadRoster();
+        state.stage = "picker";
+        return render();
+      }
+
+      case "copy-my-widget":
+        return copy(`${location.origin}/api/widget/${state.me.widgetToken}`, "내 위젯 주소");
 
       case "copy-code": return copy(state.family.joinCode, "초대 코드");
       case "copy-widget":

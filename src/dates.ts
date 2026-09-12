@@ -79,6 +79,8 @@ export interface EventRow {
   member_id: string | null;
   repeat: string;
   repeat_until: string | null;
+  owner_id?: string | null;
+  visibility?: string;
 }
 
 export interface Occurrence extends EventRow {

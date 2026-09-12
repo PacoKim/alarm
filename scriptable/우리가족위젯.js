@@ -8,7 +8,9 @@
  * [설치]
  *  1. App Store에서 "Scriptable" 설치 (무료)
  *  2. Scriptable 앱 → 우측 상단 + → 이 파일 내용을 전체 붙여넣기 → 이름: 우리가족위젯
- *  3. 스크립트를 한 번 실행하면 위젯 주소를 물어봅니다. 웹앱 설정에서 복사한 주소를 붙여넣으세요.
+ *  3. 스크립트를 한 번 실행하면 위젯 주소를 물어봅니다.
+ *     웹앱 → 설정 → "내 위젯 주소 복사"로 복사한 주소를 붙여넣으세요.
+ *     (내 위젯 주소 = 가족 공유 일정 + 내 개인 항목. 나만 쓰는 주소입니다.)
  *  4. 잠금화면: 화면 길게 누르기 → 사용자화 → 잠금화면 → 위젯 영역 탭
  *     → Scriptable 선택 → 위젯을 길게 눌러 "우리가족위젯" 스크립트 지정
  *  5. 홈화면: 빈 곳 길게 누르기 → + → Scriptable → 크기 선택 → 같은 방식으로 스크립트 지정
@@ -112,7 +114,7 @@ function whenLabel(ev, { short = false } = {}) {
 }
 
 function line(ev, { short = false } = {}) {
-  return `${whenLabel(ev, { short })}  ${ev.title}`;
+  return `${ev.private ? "🔒 " : ""}${whenLabel(ev, { short })}  ${ev.title}`;
 }
 
 /* ------------------------------ 잠금화면 위젯 ------------------------------ */
@@ -150,14 +152,16 @@ function accessoryRectangular(w, data, mode) {
   const rows = [];
 
   if (mode === "memo") {
-    for (const m of data.memos.slice(0, 3)) rows.push({ text: m.text, pin: m.pinned });
+    for (const m of data.memos.slice(0, 3)) {
+      rows.push({ text: m.text, pin: m.pinned, lock: m.private });
+    }
   } else if (mode === "event") {
     for (const ev of data.events.slice(0, 3)) rows.push({ text: line(ev, { short: true }) });
   } else {
     for (const ev of data.events.slice(0, memo ? 2 : 3)) {
       rows.push({ text: line(ev, { short: true }) });
     }
-    if (memo) rows.push({ text: memo.text, pin: true });
+    if (memo) rows.push({ text: memo.text, pin: memo.pinned, lock: memo.private });
   }
 
   if (!rows.length) {
@@ -167,7 +171,7 @@ function accessoryRectangular(w, data, mode) {
   }
 
   rows.forEach((row, i) => {
-    const t = w.addText(`${row.pin ? "📌 " : ""}${row.text}`);
+    const t = w.addText(`${row.pin ? "📌 " : ""}${row.lock ? "🔒 " : ""}${row.text}`);
     t.font = i === 0 ? Font.boldSystemFont(12) : Font.systemFont(11);
     t.lineLimit = 1;
     t.minimumScaleFactor = 0.8;
@@ -185,7 +189,7 @@ function homeHeader(w, data, stale) {
   head.layoutHorizontally();
   head.centerAlignContent();
 
-  const title = head.addText(data.family);
+  const title = head.addText(data.viewer ? `${data.family} · ${data.viewer}` : data.family);
   title.font = Font.boldSystemFont(13);
   title.textColor = BRAND;
   title.lineLimit = 1;
@@ -213,7 +217,7 @@ function eventRow(container, ev, { compact = false } = {}) {
   const gap = row.addStack();
   gap.size = new Size(7, 0);
 
-  const title = row.addText(ev.title);
+  const title = row.addText(`${ev.private ? "🔒 " : ""}${ev.title}`);
   title.font = Font.systemFont(compact ? 11 : 12.5);
   title.lineLimit = 1;
   title.minimumScaleFactor = 0.85;
@@ -233,7 +237,7 @@ function memoRow(container, memo, { compact = false } = {}) {
   row.layoutHorizontally();
   row.centerAlignContent();
 
-  const icon = row.addText(memo.pinned ? "📌" : "•");
+  const icon = row.addText(memo.private ? "🔒" : memo.pinned ? "📌" : "•");
   icon.font = Font.systemFont(compact ? 9 : 10);
 
   const gap = row.addStack();
