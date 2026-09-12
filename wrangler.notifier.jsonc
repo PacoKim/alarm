@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "alarm-notifier",
+  "main": "src/notifier.ts",
+  "compatibility_date": "2026-09-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // 공개 주소를 두지 않는다. 예약 실행으로만 깨어난다.
+  "workers_dev": false,
+
+  "vars": {
+    "VAPID_PUBLIC_KEY": "BBCGpbmj4FkLueo4iVqXuUIwYhZDGvtZ2F7ox4Mn8wVkhtBRmAqx9ACdBezey6fX8lot18PGdlsAgx3GLc2Q6gY",
+    "VAPID_SUBJECT": "https://alarm-7bi.pages.dev"
+  },
+
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "family-reminder",
+      "database_id": "2ac8f4b3-f036-43cc-bcea-99b9396758a1"
+    }
+  ]
+}

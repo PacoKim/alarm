@@ -958,6 +958,170 @@ async function saveMemo(id) {
   toast(id ? "메모를 수정했어요" : "메모를 추가했어요");
 }
 
+/* ---------- 알림 ---------- */
+
+function pushSupported() {
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+
+function b64urlToU8(b64) {
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+}
+
+function u8ToB64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function currentSubscription() {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.ready;
+  return reg.pushManager.getSubscription();
+}
+
+/** 이 기기에서 알림 켜기 */
+async function enablePush() {
+  if (!pushSupported()) {
+    throw new Error("이 브라우저는 알림을 지원하지 않습니다.");
+  }
+  if (!isStandalone() && platformGuess() === "ios") {
+    throw new Error(
+      "아이폰은 먼저 '홈 화면에 추가'를 한 뒤, 홈 화면 아이콘으로 열어서 켜야 합니다.",
+    );
+  }
+
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    throw new Error("알림 권한이 거부되었습니다. 브라우저 설정에서 허용해 주세요.");
+  }
+
+  const { publicKey } = await api("/push/key");
+  const reg = await navigator.serviceWorker.ready;
+
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: b64urlToU8(publicKey),
+    });
+  }
+
+  await api("/push/subscribe", {
+    method: "POST",
+    body: {
+      endpoint: sub.endpoint,
+      p256dh: u8ToB64url(sub.getKey("p256dh")),
+      auth: u8ToB64url(sub.getKey("auth")),
+      ua: navigator.userAgent.slice(0, 180),
+    },
+  });
+}
+
+async function disablePush() {
+  const sub = await currentSubscription();
+  if (!sub) return;
+  await api("/push/unsubscribe", { method: "POST", body: { endpoint: sub.endpoint } });
+  await sub.unsubscribe().catch(() => {});
+}
+
+const LEAD_OPTIONS = [
+  [0, "정시에"],
+  [10, "10분 전"],
+  [30, "30분 전"],
+  [60, "1시간 전"],
+  [120, "2시간 전"],
+];
+
+async function notifySheet() {
+  const sub = await currentSubscription();
+  const status = await api(
+    `/push/status${sub ? `?endpoint=${encodeURIComponent(sub.endpoint)}` : ""}`,
+  ).catch(() => null);
+
+  const supported = pushSupported();
+  const iosNeedsInstall = platformGuess() === "ios" && !isStandalone();
+  const perm = supported ? Notification.permission : "unsupported";
+  const on = !!status?.subscribed && perm === "granted";
+  const st = status?.settings ?? { enabled: true, leadMin: 30, allDayAt: "08:00", morning: null };
+
+  openSheet(`
+    <h2>알림 설정</h2>
+    <p class="lede">일정 시각이 되면 잠금화면에 알림이 뜹니다.
+      기기마다 한 번씩 켜야 합니다.</p>
+    <div class="err" hidden></div>
+
+    ${
+      !supported
+        ? `<div class="info-card"><div class="k">지원하지 않음</div>
+             <p style="margin-top:10px;margin-bottom:0">이 브라우저는 알림을 지원하지 않습니다.
+             안드로이드는 Chrome, 아이폰은 홈 화면에 추가한 앱에서 사용해 주세요.</p></div>`
+        : iosNeedsInstall
+          ? `<div class="info-card"><div class="k">먼저 홈 화면에 추가</div>
+               <p style="margin-top:10px">아이폰은 홈 화면에 추가한 앱에서만 알림을 받을 수 있습니다.
+                  (iOS 16.4 이상)</p>
+               <button class="btn ghost" data-action="install-guide">추가하는 방법 보기</button>
+             </div>`
+          : `<div class="field">
+               <button class="toggle-row" data-action="toggle-push" style="width:100%">
+                 <span class="label"><b>이 기기에서 알림 받기</b>
+                   <span>${
+                     perm === "denied"
+                       ? "브라우저에서 차단됨 · 설정에서 허용해 주세요"
+                       : on
+                         ? "켜져 있습니다"
+                         : "꺼져 있습니다"
+                   }</span></span>
+                 <span class="switch" aria-pressed="${on}"></span>
+               </button>
+             </div>
+             ${
+               status?.deviceCount
+                 ? `<p class="help" style="margin:-8px 2px 16px">가족 전체에서 ${status.deviceCount}개 기기가 알림을 받고 있어요.</p>`
+                 : ""
+             }`
+    }
+
+    <div class="info-card">
+      <div class="k">시각이 있는 일정</div>
+      <p style="margin-top:10px">언제 미리 알려줄까요?</p>
+      <div class="chips">
+        ${LEAD_OPTIONS.map(
+          ([v, l]) =>
+            `<button class="chip" data-action="set-lead" data-v="${v}"
+                     aria-pressed="${st.leadMin === v}">${l}</button>`,
+        ).join("")}
+      </div>
+    </div>
+
+    <div class="info-card">
+      <div class="k">종일 일정</div>
+      <p style="margin-top:10px">날짜만 있는 일정은 당일 이 시각에 알려줍니다.</p>
+      <input id="n-allday" type="time" value="${esc(st.allDayAt)}" />
+      <button class="btn ghost" data-action="save-allday" style="margin-top:10px">저장</button>
+    </div>
+
+    <div class="info-card">
+      <div class="k">아침 요약</div>
+      <p style="margin-top:10px">오늘 일정을 한 번에 모아서 보내줍니다.</p>
+      <button class="toggle-row" data-action="toggle-morning" style="width:100%;margin-bottom:10px">
+        <span class="label"><b>아침 요약 보내기</b>
+          <span>${st.morning ? `매일 ${esc(st.morning)}` : "꺼져 있음"}</span></span>
+        <span class="switch" data-role="morning" aria-pressed="${!!st.morning}"></span>
+      </button>
+      <input id="n-morning" type="time" value="${esc(st.morning ?? "07:30")}"
+             ${st.morning ? "" : "disabled"} />
+      <button class="btn ghost" data-action="save-morning" style="margin-top:10px">저장</button>
+    </div>
+
+    <p class="help">알림은 5분 단위로 확인해 보내므로 설정한 시각에서 최대 5분 정도
+      늦을 수 있습니다. 개인 전용 항목은 만든 사람에게만 알림이 갑니다.</p>
+  `);
+}
+
 /* ---------- 홈 화면에 추가 안내 ---------- */
 
 function isStandalone() {
@@ -1051,6 +1215,13 @@ function settingsSheet() {
       </div>
       <p>개인 PIN으로 로그인한 상태입니다. 다른 가족이 이 기기를 쓴다면 프로필을 전환하세요.</p>
       <button class="btn ghost" data-action="switch-profile">프로필 전환</button>
+    </div>
+
+    <div class="info-card">
+      <div class="k">알림</div>
+      <p style="margin-top:10px">일정 시각이 되면 잠금화면에 알림이 뜹니다.
+        기기마다 한 번씩 켜주세요.</p>
+      <button class="btn ghost" data-action="notify-settings">알림 설정</button>
     </div>
 
     <div class="info-card">
@@ -1246,6 +1417,58 @@ document.addEventListener("click", async (e) => {
       }
 
       case "install-guide": return installSheet();
+
+      case "notify-settings": return notifySheet();
+
+      case "toggle-push": {
+        const sw = el.querySelector(".switch");
+        const wasOn = sw.getAttribute("aria-pressed") === "true";
+        if (wasOn) {
+          await disablePush();
+          closeSheet();
+          await notifySheet();
+          return toast("이 기기에서 알림을 껐어요");
+        }
+        await enablePush();
+        closeSheet();
+        await notifySheet();
+        return toast("알림을 켰어요");
+      }
+
+      case "set-lead": {
+        await api("/push/settings", { method: "PATCH", body: { leadMin: Number(el.dataset.v) } });
+        closeSheet();
+        await notifySheet();
+        return toast("미리 알림 시간을 바꿨어요");
+      }
+
+      case "save-allday": {
+        const v = document.getElementById("n-allday").value;
+        if (!v) return sheetError("시각을 선택해 주세요.");
+        await api("/push/settings", { method: "PATCH", body: { allDayAt: v } });
+        closeSheet();
+        await notifySheet();
+        return toast("종일 일정 알림 시각을 저장했어요");
+      }
+
+      case "toggle-morning": {
+        const sw = el.querySelector('[data-role="morning"]');
+        const turningOn = sw.getAttribute("aria-pressed") !== "true";
+        const v = document.getElementById("n-morning").value || "07:30";
+        await api("/push/settings", { method: "PATCH", body: { morning: turningOn ? v : null } });
+        closeSheet();
+        await notifySheet();
+        return toast(turningOn ? `아침 요약을 매일 ${v}에 보내요` : "아침 요약을 껐어요");
+      }
+
+      case "save-morning": {
+        const v = document.getElementById("n-morning").value;
+        if (!v) return sheetError("시각을 선택해 주세요.");
+        await api("/push/settings", { method: "PATCH", body: { morning: v } });
+        closeSheet();
+        await notifySheet();
+        return toast(`아침 요약을 매일 ${v}에 보내요`);
+      }
       case "mic-fill": {
         // 폼 안에서 제목 칸을 음성으로 채운다
         const Rec = SpeechRec();

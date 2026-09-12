@@ -11,6 +11,12 @@
   // 저장소에 함께 커밋해 두므로 Pages 쪽 빌드 명령 설정이 필요하지 않다.
   "pages_build_output_dir": "public",
 
+  // 웹 푸시 공개키. 브라우저에 그대로 전달되는 값이라 비밀이 아니다.
+  // 비밀키는 알림 워커(wrangler.notifier.jsonc)의 시크릿으로만 둔다.
+  "vars": {
+    "VAPID_PUBLIC_KEY": "BBCGpbmj4FkLueo4iVqXuUIwYhZDGvtZ2F7ox4Mn8wVkhtBRmAqx9ACdBezey6fX8lot18PGdlsAgx3GLc2Q6gY"
+  },
+
   "d1_databases": [
     {
       "binding": "DB",

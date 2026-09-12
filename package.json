@@ -11,10 +11,13 @@
     "icons": "node scripts/make-icons.mjs",
     "typecheck": "tsc --noEmit",
     "logs": "wrangler pages deployment tail --project-name alarm",
-    "build": "node scripts/build-worker.mjs"
+    "build": "node scripts/build-worker.mjs",
+    "deploy:notifier": "wrangler deploy -c wrangler.notifier.jsonc",
+    "logs:notifier": "wrangler tail -c wrangler.notifier.jsonc"
   },
   "type": "module",
   "dependencies": {
+    "@block65/webcrypto-web-push": "^2.0.0",
     "hono": "^4.13.7"
   },
   "devDependencies": {

@@ -18,6 +18,7 @@
 | 웹앱 | [public/](public/) | 일정·메모 입력 화면 (PWA, 오프라인 지원) |
 | 아이폰 위젯 | [scriptable/우리가족위젯.js](scriptable/우리가족위젯.js) | 잠금화면·홈화면 위젯 |
 | 음성 해석 | [public/nlp.js](public/nlp.js) | 한국어 문장에서 날짜·시간·반복 추출 |
+| 알림 발송 | [src/notifier.ts](src/notifier.ts) | 5분마다 도는 예약 워커, 웹 푸시 발송 |
 | DB 스키마 | [migrations/](migrations/) | families / members / events / memos / rate_limits |
 
 ---
@@ -123,6 +124,37 @@ npm run deploy
 서버는 `Permissions-Policy: microphone=(self)` 를 보내 같은 출처의 마이크만 허용한다.
 
 ---
+
+## 3-2. 시간 맞춘 알림 (안드로이드·아이폰 공통)
+
+일정 시각에 맞춰 웹 푸시 알림을 보내 잠금화면에 띄운다. 안드로이드는 위젯을
+만들 수 없어서(PWA 한계) 알림이 잠금화면에서 일정을 확인하는 주된 수단이다.
+
+| 종류 | 언제 |
+|---|---|
+| 시각 있는 일정 | 시작 N분 전 (정시·10분·30분·1시간·2시간 중 선택, 기본 30분) |
+| 종일 일정 | 당일 지정 시각 (기본 08:00) |
+| 아침 요약 | 매일 지정 시각에 오늘 일정 모음 (기본 꺼짐) |
+
+개인 전용 항목은 만든 사람의 기기에만 간다.
+
+**켜는 법**: 앱 → ⚙ 설정 → **알림 설정** → "이 기기에서 알림 받기". 기기마다 한 번.
+- 안드로이드: Chrome 또는 설치한 앱에서 바로 가능
+- 아이폰: **홈 화면에 추가한 앱**에서만 가능 (iOS 16.4+, Safari 탭에서는 불가)
+
+### 구조
+Pages에는 예약 실행(Cron)이 없어서 발송은 별도 워커 `alarm-notifier`
+([src/notifier.ts](src/notifier.ts))가 맡는다. 앱과 같은 D1을 쓰고, 공개 주소 없이
+5분마다 깨어나 보낼 알림을 찾는다. `notify_log` 로 중복 발송을 막고,
+만료된 구독(푸시 서버가 404/410 응답)은 자동으로 지운다.
+
+```bash
+npm run deploy:notifier   # 알림 워커 배포
+npm run logs:notifier     # 발송 로그 실시간 보기
+```
+
+VAPID 공개키는 브라우저에 전달되는 값이라 `wrangler.jsonc` 의 `vars` 에 두고,
+비밀키는 알림 워커 시크릿 `VAPID_PRIVATE_KEY` 로만 보관한다.
 
 ## 4. 아이폰 위젯 설치
 

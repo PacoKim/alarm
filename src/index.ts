@@ -26,6 +26,8 @@ export interface Env {
   AUTH_SECRET: string;
   /** 가족 공간 생성에 필요한 설치 코드. 없으면 생성 자체가 잠긴다. */
   SIGNUP_CODE?: string;
+  /** 웹 푸시 공개키 (비밀이 아니며 브라우저에 그대로 전달된다) */
+  VAPID_PUBLIC_KEY?: string;
 }
 
 type Vars = { familyId: string; memberId: string | null };
@@ -706,6 +708,151 @@ app.delete("/api/memos/:id", requireMember, async (c) => {
   await c.env.DB.prepare(`DELETE FROM memos WHERE id = ? AND family_id = ?`)
     .bind(id, familyId)
     .run();
+  return c.json({ ok: true });
+});
+
+/* ------------------------------ 푸시 알림 ------------------------------ */
+
+const TIME_ONLY = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+/** 브라우저가 구독할 때 필요한 공개키 */
+app.get("/api/push/key", (c) => {
+  if (!c.env.VAPID_PUBLIC_KEY) {
+    throw new HttpError(403, "서버에 알림 설정이 되어 있지 않습니다.");
+  }
+  return c.json({ publicKey: c.env.VAPID_PUBLIC_KEY });
+});
+
+/** 기기 구독 등록 (같은 endpoint 로 다시 오면 갱신) */
+app.post("/api/push/subscribe", requireMember, async (c) => {
+  const familyId = c.get("familyId");
+  const me = c.get("memberId")!;
+  const body = await c.req.json().catch(() => ({}));
+
+  const endpoint = str(body.endpoint, "구독 주소", 700)!;
+  if (!endpoint.startsWith("https://")) {
+    throw new HttpError(400, "구독 주소가 올바르지 않습니다.");
+  }
+  const p256dh = str(body.p256dh, "구독 키", 200)!;
+  const auth = str(body.auth, "구독 키", 100)!;
+  const ua = str(body.ua, "기기", 200, false);
+
+  await c.env.DB.prepare(
+    `INSERT INTO push_subscriptions
+       (id, family_id, member_id, endpoint, p256dh, auth, ua, created_at, fail_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+     ON CONFLICT(endpoint) DO UPDATE SET
+       family_id = excluded.family_id,
+       member_id = excluded.member_id,
+       p256dh    = excluded.p256dh,
+       auth      = excluded.auth,
+       ua        = excluded.ua,
+       fail_count = 0`,
+  )
+    .bind(randomId(), familyId, me, endpoint, p256dh, auth, ua, nowIso())
+    .run();
+
+  return c.json({ ok: true });
+});
+
+app.post("/api/push/unsubscribe", requireMember, async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const endpoint = str(body.endpoint, "구독 주소", 700)!;
+  await c.env.DB.prepare(
+    `DELETE FROM push_subscriptions WHERE endpoint = ? AND family_id = ?`,
+  )
+    .bind(endpoint, c.get("familyId"))
+    .run();
+  return c.json({ ok: true });
+});
+
+/** 이 기기가 이미 등록돼 있는지 + 가족 알림 설정 */
+app.get("/api/push/status", requireMember, async (c) => {
+  const familyId = c.get("familyId");
+  const endpoint = c.req.query("endpoint") ?? "";
+
+  const [row, family] = await Promise.all([
+    endpoint
+      ? c.env.DB.prepare(
+          `SELECT member_id FROM push_subscriptions WHERE endpoint = ? AND family_id = ?`,
+        )
+          .bind(endpoint, familyId)
+          .first<{ member_id: string }>()
+      : Promise.resolve(null),
+    c.env.DB.prepare(
+      `SELECT notify_enabled, notify_lead_min, notify_allday_at, notify_morning
+       FROM families WHERE id = ?`,
+    )
+      .bind(familyId)
+      .first<{
+        notify_enabled: number;
+        notify_lead_min: number;
+        notify_allday_at: string;
+        notify_morning: string | null;
+      }>(),
+  ]);
+
+  const count = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS c FROM push_subscriptions WHERE family_id = ?`,
+  )
+    .bind(familyId)
+    .first<{ c: number }>();
+
+  return c.json({
+    subscribed: !!row,
+    deviceCount: count?.c ?? 0,
+    hasKey: !!c.env.VAPID_PUBLIC_KEY,
+    settings: {
+      enabled: !!family?.notify_enabled,
+      leadMin: family?.notify_lead_min ?? 30,
+      allDayAt: family?.notify_allday_at ?? "08:00",
+      morning: family?.notify_morning ?? null,
+    },
+  });
+});
+
+/** 가족 공통 알림 설정 변경 */
+app.patch("/api/push/settings", requireMember, async (c) => {
+  const familyId = c.get("familyId");
+  const body = await c.req.json().catch(() => ({}));
+  const sets: string[] = [];
+  const args: (string | number | null)[] = [];
+
+  if ("enabled" in body) {
+    sets.push("notify_enabled = ?");
+    args.push(body.enabled ? 1 : 0);
+  }
+  if ("leadMin" in body) {
+    const n = Number(body.leadMin);
+    if (![0, 10, 30, 60, 120].includes(n)) {
+      throw new HttpError(400, "미리 알림 시간이 올바르지 않습니다.");
+    }
+    sets.push("notify_lead_min = ?");
+    args.push(n);
+  }
+  if ("allDayAt" in body) {
+    const t = str(body.allDayAt, "종일 일정 알림 시각", 5)!;
+    if (!TIME_ONLY.test(t)) throw new HttpError(400, "시각 형식이 올바르지 않습니다.");
+    sets.push("notify_allday_at = ?");
+    args.push(t);
+  }
+  if ("morning" in body) {
+    if (body.morning === null || body.morning === "") {
+      sets.push("notify_morning = ?");
+      args.push(null);
+    } else {
+      const t = str(body.morning, "아침 요약 시각", 5)!;
+      if (!TIME_ONLY.test(t)) throw new HttpError(400, "시각 형식이 올바르지 않습니다.");
+      sets.push("notify_morning = ?");
+      args.push(t);
+    }
+  }
+  if (!sets.length) throw new HttpError(400, "변경할 내용이 없습니다.");
+
+  await c.env.DB.prepare(`UPDATE families SET ${sets.join(", ")} WHERE id = ?`)
+    .bind(...args, familyId)
+    .run();
+
   return c.json({ ok: true });
 });
 
