@@ -13,7 +13,8 @@
     "logs": "wrangler pages deployment tail --project-name alarm",
     "build": "node scripts/build-worker.mjs",
     "deploy:notifier": "wrangler deploy -c wrangler.notifier.jsonc",
-    "logs:notifier": "wrangler tail -c wrangler.notifier.jsonc"
+    "logs:notifier": "wrangler tail -c wrangler.notifier.jsonc",
+    "test": "node scripts/test-nlp.mjs"
   },
   "type": "module",
   "dependencies": {

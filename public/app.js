@@ -127,6 +127,7 @@ async function refresh() {
   try {
     const data = await api("/state");
     Object.assign(state, data, { loading: false, stage: "app" });
+    updateBadge();
   } catch (err) {
     // 가족 공간에는 들어왔지만 "내가 누구인지"를 아직 안 고른 상태
     if (err.status === 403) {
@@ -148,6 +149,7 @@ async function loadRoster() {
 
 function logout() {
   localStorage.removeItem(TOKEN_KEY);
+  navigator.clearAppBadge?.().catch(() => {});
   Object.assign(state, {
     token: null,
     stage: "onboard",
@@ -439,6 +441,7 @@ function render() {
 
       <main>
         ${heroCard(todayEvents, openMemos)}
+        ${quickAddBar()}
 
         <div class="tabs" role="tablist" data-tab="${state.tab}">
           <span class="glider"></span>
@@ -866,7 +869,7 @@ function eventSheet(ev, opts = {}) {
       <label for="e-title">무슨 일정인가요?</label>
       <div class="row-2">
         <input id="e-title" type="text" maxlength="120" value="${esc(ev?.title ?? "")}"
-               placeholder="예: 지훈이 치과 예약" />
+               placeholder="예: 내일 3시 지훈이 치과" ${editing ? "" : 'data-autoparse="1"'} />
         ${
           voiceSupported()
             ? `<button class="fab-mic" data-action="mic-fill" data-field="e-title"
@@ -874,6 +877,7 @@ function eventSheet(ev, opts = {}) {
             : ""
         }
       </div>
+      <p class="help" id="e-hint" hidden></p>
     </div>
 
     <div class="field">
@@ -988,8 +992,15 @@ function pickedMember() {
 }
 
 async function saveEvent(id) {
+  // 새 일정 제목에 "내일 3시" 같은 말이 있으면 날짜 칸으로 옮겼으므로 제목에서는 뺀다
+  const titleEl = document.getElementById("e-title");
+  let title = titleEl.value.trim();
+  if (titleEl.dataset.autoparse) {
+    const p = parseKoreanSchedule(title, state.today);
+    if (p.matched.length && p.title) title = p.title;
+  }
   const payload = {
-    title: document.getElementById("e-title").value.trim(),
+    title,
     date: document.getElementById("e-date").value,
     time: document.getElementById("e-time").value || null,
     location: document.getElementById("e-location")?.value.trim() || null,
@@ -1225,6 +1236,182 @@ async function notifySheet() {
   `);
 }
 
+/* ---------- 편의 기능: 빠른 추가 · 자동 해석 · 배지 · 바로가기 · 캘린더 ---------- */
+
+function nowHM() {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date());
+}
+
+function quickAddBar() {
+  const memo = state.tab === "memos";
+  return `
+    <div class="quick-add">
+      <input id="qa-input" type="text" enterkeyhint="done" maxlength="200" autocomplete="off"
+             placeholder="${memo ? "메모 한 줄 · 예: 우유 사오기" : "한 줄로 추가 · 예: 내일 3시 치과"}" />
+      <button class="qa-go" data-action="quick-add" aria-label="추가">＋</button>
+    </div>
+    <div class="qa-preview" id="qa-preview" hidden></div>`;
+}
+
+function updateQuickPreview() {
+  const box = document.getElementById("qa-preview");
+  const raw = document.getElementById("qa-input")?.value.trim();
+  if (!box) return;
+  if (!raw || state.tab === "memos") {
+    box.hidden = true;
+    return;
+  }
+  const p = parseKoreanSchedule(raw, state.today);
+  const tags = [p.date ? dayTagLabel(p.date) : "오늘", p.time ? timeTagLabel(p.time) : "종일"];
+  if (p.repeat !== "none") tags.push(REPEAT_SHORT[p.repeat]);
+  box.innerHTML = `<span class="qa-title">${esc(p.title || raw)}</span>${tags
+    .map((t) => `<span class="pp-tag">${esc(t)}</span>`)
+    .join("")}`;
+  box.hidden = false;
+}
+
+async function quickAdd() {
+  const input = document.getElementById("qa-input");
+  const raw = input?.value.trim();
+  if (!raw || input.disabled) return;
+  input.disabled = true;
+  try {
+    if (state.tab === "memos") {
+      await api("/memos", { method: "POST", body: { text: raw } });
+      await refresh();
+      return toast("메모를 추가했어요");
+    }
+    const p = parseKoreanSchedule(raw, state.today);
+    const title = p.title || raw;
+    const date = p.date ?? state.today;
+    await api("/events", {
+      method: "POST",
+      body: { title, date, time: p.time, repeat: p.repeat },
+    });
+    await refresh();
+    toast(`${dayTagLabel(date)}${p.time ? ` ${timeTagLabel(p.time)}` : ""} · ${title} 추가했어요`);
+  } catch (err) {
+    input.disabled = false;
+    toast(err.message);
+  }
+}
+
+/** 새 일정 제목을 치는 동안 날짜·시간·반복 칸을 자동으로 채운다 */
+function autoFillFromTitle(input) {
+  const p = parseKoreanSchedule(input.value, state.today);
+  const parts = [];
+  if (p.date) {
+    document.getElementById("e-date").value = p.date;
+    parts.push(dayTagLabel(p.date));
+  }
+  if (p.time) {
+    document.getElementById("e-time").value = p.time;
+    parts.push(timeTagLabel(p.time));
+  }
+  if (p.repeat !== "none") {
+    const sel = document.getElementById("e-repeat");
+    if (sel) sel.value = p.repeat;
+    parts.push(REPEAT_SHORT[p.repeat]);
+  }
+  syncChips();
+  const hint = document.getElementById("e-hint");
+  if (hint) {
+    hint.textContent = parts.length ? `✨ 자동 입력: ${parts.join(" · ")}` : "";
+    hint.hidden = !parts.length;
+  }
+}
+
+/** 홈 화면 아이콘에 오늘 남은 일정 수를 표시한다 (지원하는 기기만) */
+function updateBadge() {
+  if (!("setAppBadge" in navigator)) return;
+  const now = nowHM();
+  const n = state.events.filter(
+    (e) => e.date === state.today && (!e.time || e.time >= now),
+  ).length;
+  (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
+}
+
+let sharedDraft = null;
+
+/** 앱 아이콘 바로가기(?do=) 와 다른 앱에서 공유(?share_text=) 처리 */
+function handleLaunchParams() {
+  const q = new URLSearchParams(location.search);
+  const act = q.get("do");
+  const shared = [q.get("share_title"), q.get("share_text"), q.get("share_url")]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+  if (!act && !shared) return;
+  history.replaceState(null, "", location.pathname);
+
+  if (state.stage !== "app") return toast("먼저 내 이름으로 로그인해 주세요");
+  if (shared) return shareSheet(shared);
+  if (act === "voice") return voiceSupported() ? voiceSheet() : eventSheet(null);
+  if (act === "new-event") return eventSheet(null);
+  if (act === "new-memo") {
+    state.tab = "memos";
+    render();
+    return memoSheet(null);
+  }
+}
+
+function shareSheet(text) {
+  const parsed = parseKoreanSchedule(text, state.today);
+  sharedDraft = { text, parsed };
+  const looksEvent = !!(parsed.date || parsed.time);
+  const when = looksEvent
+    ? ` · ${dayTagLabel(parsed.date ?? state.today)}${parsed.time ? ` ${timeTagLabel(parsed.time)}` : ""}`
+    : "";
+  openSheet(`
+    <h2>공유받은 내용 추가</h2>
+    <div class="parse-preview"><div class="pp-title">${esc(text.slice(0, 200))}</div></div>
+    <button class="btn ${looksEvent ? "" : "ghost"}" data-action="share-as-event">📅 일정으로 추가${esc(when)}</button>
+    <button class="btn ${looksEvent ? "ghost" : ""}" data-action="share-as-memo"
+            style="margin-top:8px">📝 메모로 추가</button>
+  `);
+}
+
+function calendarUrls() {
+  const tok = state.me?.widgetToken || state.family.widgetToken;
+  const https = `${location.origin}/api/calendar/${tok}.ics`;
+  return { https, webcal: https.replace(/^https?:/, "webcal:") };
+}
+
+function calendarSheet() {
+  const { webcal } = calendarUrls();
+  const calName = `${state.family.name}${state.me?.name ? ` · ${state.me.name}` : ""}`;
+  const ios = `
+    <div class="info-card">
+      <div class="k">아이폰</div>
+      <p style="margin-top:10px">아래 버튼을 누르고 <b>구독</b> → <b>추가</b>를 누르면 끝입니다.
+        캘린더 앱에 '${esc(calName)}' 캘린더가 생겨요.</p>
+      <a class="btn" href="${esc(webcal)}"
+         style="display:block;text-align:center;text-decoration:none">아이폰 캘린더에 추가</a>
+      <p class="help">새로 받아오는 주기는 설정 → 캘린더 → 계정 → 구독 캘린더에서
+        '15분마다'로 바꾸면 가장 빨라요.</p>
+    </div>`;
+  const android = `
+    <div class="info-card">
+      <div class="k">안드로이드 · 구글 캘린더</div>
+      <p style="margin-top:10px">
+        1. 아래 버튼으로 캘린더 주소를 복사하세요<br />
+        2. 브라우저에서 <b>calendar.google.com</b> 을 여세요<br />
+        3. 왼쪽 '다른 캘린더' 옆 <b>＋</b> → <b>URL로 추가</b> → 붙여넣기</p>
+      <button class="btn ghost" data-action="copy-calendar">캘린더 주소 복사</button>
+      <p class="help">구글 캘린더는 몇 시간에 한 번씩만 새로 받아와요.
+        방금 넣은 일정은 앱 알림으로 먼저 확인하세요.</p>
+    </div>`;
+  openSheet(`
+    <h2>휴대폰 캘린더에 표시</h2>
+    <p class="lede">읽기 전용으로 연결돼요. 이 앱에서 일정을 추가·수정하면
+      휴대폰 캘린더에도 자동으로 반영됩니다.</p>
+    ${platformGuess() === "android" ? android + ios : ios + android}
+    <p class="help">이 주소에는 내 '나만 보기' 일정도 들어 있어요. 다른 사람에게 보내지 마세요.</p>
+  `);
+}
+
 /* ---------- 홈 화면에 추가 안내 ---------- */
 
 function isStandalone() {
@@ -1336,6 +1523,13 @@ function settingsSheet() {
       <p style="margin-top:10px">일정 시각이 되면 잠금화면에 알림이 뜹니다.
         기기마다 한 번씩 켜주세요.</p>
       <button class="btn ghost" data-action="notify-settings">알림 설정</button>
+    </div>
+
+    <div class="info-card">
+      <div class="k">휴대폰 캘린더에 표시</div>
+      <p style="margin-top:10px">가족 일정이 휴대폰 기본 캘린더 앱에 함께 떠요.
+        캘린더 위젯이나 "시리야, 오늘 일정 뭐야?"로도 확인할 수 있어요.</p>
+      <button class="btn ghost" data-action="calendar-guide">캘린더에 추가하는 방법</button>
     </div>
 
     <div class="info-card">
@@ -1528,6 +1722,30 @@ document.addEventListener("click", async (e) => {
 
       case "notify-settings": return notifySheet();
 
+      case "quick-add": return quickAdd();
+      case "calendar-guide": return calendarSheet();
+      case "copy-calendar": return copy(calendarUrls().https, "캘린더 주소");
+      case "share-as-event": {
+        const d = sharedDraft;
+        closeSheet();
+        return eventSheet(
+          {
+            title: (d.parsed.title || d.text).slice(0, 120),
+            date: d.parsed.date ?? state.today,
+            time: d.parsed.time ?? null,
+            repeat: d.parsed.repeat ?? "none",
+          },
+          { draft: true },
+        );
+      }
+      case "share-as-memo": {
+        const d = sharedDraft;
+        closeSheet();
+        state.tab = "memos";
+        render();
+        return memoSheet({ text: d.text.slice(0, 300) }, { draft: true });
+      }
+
       case "toggle-push": {
         const sw = el.querySelector(".switch");
         const wasOn = sw.getAttribute("aria-pressed") === "true";
@@ -1592,6 +1810,7 @@ document.addEventListener("click", async (e) => {
           let out = "";
           for (let i = 0; i < e.results.length; i++) out += e.results[i][0].transcript;
           field.value = out.trim();
+          if (field.dataset.autoparse) autoFillFromTitle(field);
         };
         recognizer.onend = () => { el.textContent = "🎙️"; };
         recognizer.onerror = () => {
@@ -1727,6 +1946,16 @@ document.addEventListener("click", async (e) => {
 
 document.addEventListener("input", (e) => {
   if (e.target.id === "e-date" || e.target.id === "e-time") syncChips();
+  if (e.target.id === "e-title" && e.target.dataset.autoparse) autoFillFromTitle(e.target);
+  if (e.target.id === "qa-input") updateQuickPreview();
+});
+
+// 빠른 추가: 엔터로 바로 등록. 한글 조합 중의 엔터는 무시한다
+document.addEventListener("keydown", (e) => {
+  if (e.target?.id === "qa-input" && e.key === "Enter" && !e.isComposing) {
+    e.preventDefault();
+    quickAdd();
+  }
 });
 
 // 앱으로 돌아올 때 자동으로 최신 상태를 받아온다
@@ -1758,7 +1987,9 @@ state.today = todayISO();
     toast(err.message);
   }
   if (state.token) {
-    refresh().catch((err) => {
+    refresh()
+      .then(handleLaunchParams)
+      .catch((err) => {
       state.loading = false;
       render();
       toast(err.message);

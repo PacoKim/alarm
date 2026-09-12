@@ -1,5 +1,5 @@
 // 앱 껍데기만 캐시한다. API 응답은 항상 네트워크에서 받아 최신 일정을 보장한다.
-const CACHE = "family-reminder-v3";
+const CACHE = "family-reminder-v4";
 const SHELL = [
   "/",
   "/index.html",
@@ -64,7 +64,13 @@ self.addEventListener("push", (event) => {
     data: { url: data.url || "/" },
   };
 
-  event.waitUntil(self.registration.showNotification(title, options));
+  event.waitUntil(
+    Promise.all([
+      self.registration.showNotification(title, options),
+      // 홈 화면 아이콘에 표시만 켜 둔다. 정확한 숫자는 앱을 열 때 다시 계산한다
+      self.navigator.setAppBadge ? self.navigator.setAppBadge().catch(() => {}) : null,
+    ]),
+  );
 });
 
 self.addEventListener("notificationclick", (event) => {

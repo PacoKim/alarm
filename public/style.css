@@ -939,3 +939,35 @@ details[open] > summary::before { content: "− "; }
   20%, 60% { transform: translateX(-9px); }
   40%, 80% { transform: translateX(9px); }
 }
+
+/* ==========================  한 줄 빠른 추가  ========================== */
+
+.quick-add { display: flex; gap: 8px; margin: 14px 0 0; }
+.quick-add input { flex: 1; min-width: 0; }
+.qa-go {
+  flex: 0 0 52px;
+  border-radius: 14px;
+  background: var(--grad);
+  color: #fff;
+  font-size: 24px; font-weight: 700;
+  box-shadow: var(--sh-brand);
+  transition: transform 0.1s;
+}
+.qa-go:active { transform: scale(0.93); }
+.qa-preview {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  margin: 9px 4px 0;
+  font-size: 12.5px;
+  animation: rise-in 0.2s both;
+}
+.qa-preview .qa-title { font-weight: 750; color: var(--text); margin-right: 2px; }
+#e-hint { margin: 8px 2px 0; color: var(--brand-ink); font-weight: 700; }
+.qa-preview .pp-tag {
+  font-size: 11.5px; font-weight: 750;
+  padding: 3px 9px; border-radius: 999px;
+  background: var(--brand-soft); color: var(--brand-ink);
+}
+
+/* 시트 안 어디서든 쓰는 보조 설명 */
+.sheet .help { font-size: 12.5px; color: var(--text-dim); line-height: 1.55; margin: 8px 2px 0; }
+.sheet > .help { margin: 14px 4px 0; }

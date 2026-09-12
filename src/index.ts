@@ -10,6 +10,7 @@ import {
   verifyToken,
 } from "./auth";
 import { rateLimit, sweepRateLimits } from "./ratelimit";
+import { buildIcs, type IcsEvent } from "./ics";
 import {
   addDays,
   dayLabel,
@@ -985,6 +986,70 @@ app.get("/api/widget/:token", async (c) => {
 });
 
 /* ------------------------------ 정적 파일 / SPA 폴백 ------------------------------ */
+
+/* ------------------------------ 휴대폰 캘린더 구독 (ICS) ------------------------------ */
+
+/**
+ * 위젯 토큰으로 보는 사람을 판별한다.
+ *   구성원 토큰 → 가족 공유 항목 + 그 사람의 개인 항목
+ *   가족 토큰   → 가족 공유 항목만
+ */
+async function resolveViewer(db: D1Database, token: string) {
+  const m = await db
+    .prepare(
+      `SELECT m.id AS member_id, m.name AS member_name, f.id AS family_id, f.name AS family_name
+       FROM members m JOIN families f ON f.id = m.family_id WHERE m.widget_token = ?`,
+    )
+    .bind(token)
+    .first<{ member_id: string; member_name: string; family_id: string; family_name: string }>();
+  if (m) {
+    return { familyId: m.family_id, familyName: m.family_name, viewerId: m.member_id, viewerName: m.member_name };
+  }
+  const f = await db
+    .prepare(`SELECT id, name FROM families WHERE widget_token = ?`)
+    .bind(token)
+    .first<{ id: string; name: string }>();
+  return f ? { familyId: f.id, familyName: f.name, viewerId: null, viewerName: null } : null;
+}
+
+app.get("/api/calendar/:file", async (c) => {
+  // 휴대폰 캘린더가 주기적으로 받아간다. 토큰 대량 추측만 막을 만큼 넉넉히 둔다
+  await guard(c, "calendar", 60, 60);
+
+  const token = c.req.param("file").replace(/\.ics$/i, "");
+  const viewer = await resolveViewer(c.env.DB, token);
+  if (!viewer) throw new HttpError(404, "캘린더 주소가 올바르지 않습니다.");
+
+  const rows = (
+    await c.env.DB.prepare(
+      `SELECT e.id, e.title, e.date, e.time, e.end_time, e.location, e.notes, e.member_id,
+              e.repeat, e.repeat_until, e.owner_id, e.visibility, e.updated_at,
+              m.name AS member_name
+       FROM events e LEFT JOIN members m ON m.id = e.member_id
+       WHERE e.family_id = ?
+         AND (e.visibility = 'family' OR e.owner_id = ?)
+         AND (e.repeat != 'none' OR e.date >= ?)`,
+    )
+      .bind(viewer.familyId, viewer.viewerId, addDays(todayKST(), -60))
+      .all<IcsEvent>()
+  ).results ?? [];
+
+  const ics = buildIcs({
+    calName: viewer.viewerName
+      ? `${viewer.familyName} · ${viewer.viewerName}`
+      : `${viewer.familyName} 가족`,
+    host: new URL(c.req.url).host,
+    events: rows,
+  });
+
+  return new Response(ics, {
+    headers: {
+      "content-type": "text/calendar; charset=utf-8",
+      "content-disposition": 'inline; filename="family.ics"',
+      "cache-control": "private, max-age=300",
+    },
+  });
+});
 
 app.all("/api/*", (c) => c.json({ error: "요청한 API를 찾을 수 없습니다." }, 404));
 
