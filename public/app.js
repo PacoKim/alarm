@@ -98,18 +98,20 @@ async function copy(text, label) {
 
 /* ------------------------------ API ------------------------------ */
 
-async function api(path, { method = "GET", body } = {}) {
+async function api(path, { method = "GET", body, noAuth = false, keepSession = false } = {}) {
   const res = await fetch(`/api${path}`, {
     method,
     headers: {
       ...(body ? { "content-type": "application/json" } : {}),
-      ...(state.token ? { authorization: `Bearer ${state.token}` } : {}),
+      ...(state.token && !noAuth ? { authorization: `Bearer ${state.token}` } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   });
 
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && state.token) {
+  // 잘못된 초대 링크(401) 때문에 멀쩡한 로그인이 풀리지 않도록 noAuth 요청은 제외한다
+  // keepSession: 비밀번호 확인처럼 401이 "틀렸다"는 뜻인 요청은 로그인을 풀지 않는다
+  if (res.status === 401 && state.token && !noAuth && !keepSession) {
     logout();
     throw new Error("세션이 만료되었습니다. 다시 로그인해 주세요.");
   }
@@ -139,8 +141,9 @@ async function refresh() {
 }
 
 async function loadRoster() {
-  const { members } = await api("/members/roster");
+  const { members, familyName } = await api("/members/roster");
   state.roster = members;
+  if (familyName) state.familyName = familyName;
 }
 
 function logout() {
@@ -158,6 +161,52 @@ function logout() {
   render();
 }
 
+/* ------------------------------ 초대 링크 ------------------------------ */
+
+function inviteLink(code) {
+  // 해시(#)에 담아 서버 로그·리퍼러에 코드가 남지 않게 한다
+  return `${location.origin}/#join=${code}`;
+}
+
+function fmtInvite(code) {
+  return String(code || "").replace(/(.{4})(?=.)/g, "$1-");
+}
+
+/** 주소에 #join=코드 가 있으면 자동으로 가족 공간에 들어간다 */
+async function handleInviteLink() {
+  const m = location.hash.match(/join=([A-Za-z0-9-]+)/);
+  if (!m) return false;
+  history.replaceState(null, "", location.pathname + location.search);
+
+  const res = await api("/family/join", {
+    method: "POST",
+    body: { inviteCode: m[1] },
+    noAuth: true,
+  });
+
+  // 이미 같은 가족으로 로그인돼 있으면 그대로 둔다
+  if (state.token) {
+    try {
+      const cur = await api("/state");
+      if (cur.family?.id === res.family.id) {
+        Object.assign(state, cur, { loading: false, stage: "app" });
+        render();
+        toast("이미 참여 중인 가족이에요");
+        return true;
+      }
+    } catch {
+      // 프로필 선택 전이거나 다른 가족 → 새 링크로 들어간다
+    }
+  }
+
+  localStorage.setItem(TOKEN_KEY, res.token);
+  state.token = res.token;
+  state.familyName = res.family.name;
+  await refresh();
+  toast(`${res.family.name}에 오신 걸 환영해요`);
+  return true;
+}
+
 /* ------------------------------ 온보딩 ------------------------------ */
 
 function renderOnboard() {
@@ -169,10 +218,13 @@ function renderOnboard() {
         일정과 메모를 가족이 한곳에 모아두면,
         아이폰 잠금화면 위젯에 바로 떠서 아무도 잊지 않습니다.
       </p>
-      <button class="btn" data-action="show-join">초대 코드로 참여하기</button>
+      <div class="invite-hint">
+        <span class="ic">💌</span>
+        <span>가족에게 <b>초대 링크</b>를 받았다면<br />그 링크를 누르기만 하면 돼요.</span>
+      </div>
+      <button class="btn ghost" data-action="show-join">초대 코드 직접 입력</button>
       <button class="btn ghost" data-action="show-create">가족 공간 새로 만들기</button>
       <p class="foot">
-        가족에게 초대 코드를 받았다면 위쪽을 누르세요.<br />
         <a href="#" data-action="install-guide"
            style="color:var(--brand);font-weight:700;text-decoration:none">
           휴대폰에 앱으로 설치하는 방법 →</a>
@@ -193,11 +245,6 @@ function createSheet() {
       <input id="f-members" type="text" placeholder="예: 엄마, 아빠, 지훈" />
     </div>
     <div class="field">
-      <label for="f-pin">공용 PIN (숫자 4~8자리)</label>
-      <input id="f-pin" type="text" inputmode="numeric" autocomplete="off"
-             placeholder="가족에게 알려줄 번호" maxlength="8" />
-    </div>
-    <div class="field">
       <label for="f-signup">설치 코드</label>
       <input id="f-signup" type="password" autocomplete="off" maxlength="200"
              placeholder="배포할 때 받은 코드" />
@@ -213,14 +260,11 @@ function joinSheet() {
   openSheet(`
     <h2>가족 공간 참여하기</h2>
     <div class="err" hidden></div>
+    <p class="lede">초대 링크를 누를 수 없을 때만 쓰세요. 링크 끝의 12자리 코드입니다.</p>
     <div class="field">
       <label for="j-code">초대 코드</label>
-      <input id="j-code" type="text" placeholder="예: K7MQ4P" maxlength="12"
+      <input id="j-code" type="text" placeholder="예: K7MQ-4P2X-9HTR" maxlength="20"
              autocapitalize="characters" autocomplete="off" style="text-transform:uppercase" />
-    </div>
-    <div class="field">
-      <label for="j-pin">공용 PIN</label>
-      <input id="j-pin" type="text" inputmode="numeric" autocomplete="off" maxlength="8" />
     </div>
     <button class="btn" data-action="do-join">참여하기</button>
   `, () => document.getElementById("j-code")?.focus());
@@ -235,12 +279,10 @@ function renderPicker() {
   const card = (m) => `
     <button class="row" data-action="pick-profile" data-id="${esc(m.id)}"
             data-name="${esc(m.name)}" data-claimed="${m.claimed ? "1" : "0"}">
-      <span class="when" style="flex:0 0 auto">
-        <span class="dot" style="display:inline-block;width:14px;height:14px;border-radius:50%;background:${esc(m.color)}"></span>
-      </span>
+      <span class="when" style="flex:0 0 auto">${avatar(m, "lg")}</span>
       <span class="body">
         <span class="title">${esc(m.name)}</span>
-        <span class="meta">${m.claimed ? "개인 PIN 입력" : "처음 로그인 · 개인 PIN을 새로 정합니다"}</span>
+        <span class="meta">${m.claimed ? "비밀번호 입력" : "처음이에요 · 비밀번호 4자리를 정해요"}</span>
       </span>
     </button>`;
 
@@ -248,7 +290,7 @@ function renderPicker() {
     <div class="app">
       <header class="topbar">
         <h1>나는 누구인가요?
-          <span class="sub">${esc(state.familyName ?? "가족 공간")} · 내 일정과 개인 메모를 구분하기 위해 필요해요</span>
+          <span class="sub">${esc(state.familyName ?? "가족 공간")} · 내 이름을 눌러 주세요</span>
         </h1>
       </header>
       <main>
@@ -287,25 +329,86 @@ function renderPicker() {
     </div>`;
 }
 
+/* 비밀번호 키패드. 처음 정할 때는 4자리 · 숫자를 보여주고 4개가 되면 바로 저장,
+   로그인할 때는 점으로 가리고 확인 버튼으로 보낸다(예전에 6자리 이상으로 정한 사람도 있음). */
+let pinEntry = null;
+
 function profilePinSheet(id, name, claimed) {
+  pinEntry = { id, name, claimed, digits: "", busy: false };
+  const keys = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    .map((n) => `<button class="key" data-action="pin-key" data-k="${n}">${n}</button>`)
+    .join("");
+
   openSheet(`
-    <h2>${esc(name)} 님으로 로그인</h2>
-    <div class="err" hidden></div>
-    ${
+    <h2>${claimed ? `${esc(name)} 님, 반가워요` : `${esc(name)} 님의 비밀번호 정하기`}</h2>
+    <p class="lede">${
       claimed
-        ? `<p style="margin:0 0 16px;font-size:14px;color:var(--text-dim);line-height:1.6">
-             ${esc(name)} 님이 정한 <b>개인 PIN</b>을 입력해 주세요.</p>`
-        : `<p style="margin:0 0 16px;font-size:14px;color:var(--text-dim);line-height:1.6">
-             이 프로필은 아직 주인이 없어요. 지금 입력하는 번호가
-             <b>${esc(name)} 님의 개인 PIN</b>이 됩니다. 가족 공용 PIN과 다르게 정해도 됩니다.</p>`
-    }
-    <div class="field">
-      <label for="p-pin">개인 PIN (숫자 4~8자리)</label>
-      <input id="p-pin" type="password" inputmode="numeric" autocomplete="off" maxlength="8" />
+        ? "내 비밀번호를 눌러 주세요."
+        : "숫자 4개를 정해 주세요. '나만 보기' 항목을 지켜주는 번호예요."
+    }</p>
+    <div class="err" hidden></div>
+    <div class="pin-dots ${claimed ? "masked" : ""}" id="pin-dots"></div>
+    <div class="keypad">
+      ${keys}
+      <button class="key ghost" data-action="pin-back" aria-label="지우기">⌫</button>
+      <button class="key" data-action="pin-key" data-k="0">0</button>
+      <button class="key ok" data-action="pin-ok">확인</button>
     </div>
-    <button class="btn" data-action="do-claim" data-id="${esc(id)}">
-      ${claimed ? "로그인" : "이 프로필 사용하기"}</button>
-  `, () => document.getElementById("p-pin")?.focus());
+  `);
+  drawPinDots();
+}
+
+function drawPinDots() {
+  const el = document.getElementById("pin-dots");
+  if (!el || !pinEntry) return;
+  const { digits, claimed } = pinEntry;
+  const slots = claimed ? Math.max(4, digits.length) : 4;
+  el.innerHTML = Array.from({ length: slots }, (_, i) => {
+    const d = digits[i];
+    return `<span class="pin-dot ${d !== undefined ? "on" : ""}">${
+      !claimed && d !== undefined ? d : ""
+    }</span>`;
+  }).join("");
+}
+
+function pinPress(k) {
+  if (!pinEntry || pinEntry.busy) return;
+  const max = pinEntry.claimed ? 8 : 4;
+  if (k === "back") pinEntry.digits = pinEntry.digits.slice(0, -1);
+  else if (pinEntry.digits.length < max) pinEntry.digits += k;
+  drawPinDots();
+  // 새로 정할 때는 4개를 누르면 바로 저장한다
+  if (!pinEntry.claimed && pinEntry.digits.length === 4) setTimeout(submitPin, 220);
+}
+
+async function submitPin() {
+  if (!pinEntry || pinEntry.busy) return;
+  const { id, digits } = pinEntry;
+  if (digits.length < 4) return sheetError("숫자를 4개 이상 눌러 주세요.");
+
+  pinEntry.busy = true;
+  try {
+    const res = await api("/members/claim", {
+      method: "POST",
+      body: { memberId: id, pin: digits },
+      keepSession: true,
+    });
+    localStorage.setItem(TOKEN_KEY, res.token);
+    state.token = res.token;
+    pinEntry = null;
+    closeSheet();
+    await refresh();
+    toast(`${res.me.name} 님으로 로그인했어요`);
+  } catch (err) {
+    pinEntry.busy = false;
+    pinEntry.digits = "";
+    drawPinDots();
+    const dots = document.getElementById("pin-dots");
+    dots?.classList.remove("shake");
+    void dots?.offsetWidth;
+    dots?.classList.add("shake");
+    sheetError(err.message);
+  }
 }
 
 function render() {
@@ -1187,8 +1290,8 @@ function installSheet() {
     <div class="info-card">
       <div class="k">가족에게 보낼 때</div>
       <p style="margin-top:10px;margin-bottom:0">
-        이 주소와 <b>초대 코드 · 공용 PIN</b>을 함께 보내주세요.
-        가족은 주소를 열고 "초대 코드로 참여하기"를 누르면 됩니다.
+        설정 → <b>가족 초대</b> → "초대 링크 보내기"로 카톡에 보내면,
+        가족은 링크를 누르고 이름만 고르면 됩니다.
       </p>
       <button class="btn ghost" data-action="copy-url" style="margin-top:12px">
         앱 주소 복사</button>
@@ -1213,8 +1316,19 @@ function settingsSheet() {
         <span style="width:12px;height:12px;border-radius:50%;background:${esc(state.me?.color ?? "#888")}"></span>
         <b style="font-size:17px">${esc(state.me?.name ?? "-")}</b>
       </div>
-      <p>개인 PIN으로 로그인한 상태입니다. 다른 가족이 이 기기를 쓴다면 프로필을 전환하세요.</p>
+      <p>비밀번호로 로그인한 상태입니다. 다른 가족이 이 기기를 쓴다면 프로필을 전환하세요.</p>
       <button class="btn ghost" data-action="switch-profile">프로필 전환</button>
+    </div>
+
+    <div class="info-card">
+      <div class="k">가족 초대</div>
+      <p style="margin-top:10px">이 링크를 카톡으로 보내면 가족은 누르고 이름만 고르면 돼요.
+        비밀번호는 각자 정합니다.</p>
+      <div class="v invite">${esc(fmtInvite(state.family.inviteCode))}</div>
+      <button class="btn" data-action="share-invite">초대 링크 보내기</button>
+      <button class="btn ghost" data-action="reset-invite" style="margin-top:8px">새 초대 링크 만들기</button>
+      <p class="help">모르는 사람에게 링크가 퍼졌다면 새로 만드세요. 이전 링크는 바로 막히고,
+        이미 들어온 가족은 그대로 유지됩니다.</p>
     </div>
 
     <div class="info-card">
@@ -1231,13 +1345,6 @@ function settingsSheet() {
         ${isStandalone() ? "<b>현재 앱으로 실행 중입니다.</b>" : ""}
       </p>
       <button class="btn ghost" data-action="install-guide">설치 방법 보기</button>
-    </div>
-
-    <div class="info-card">
-      <div class="k">가족 초대 코드</div>
-      <div class="v">${esc(state.family.joinCode)}</div>
-      <p>가족에게 이 코드와 공용 PIN을 알려주면 같은 일정·메모를 함께 볼 수 있어요.</p>
-      <button class="btn ghost" data-action="copy-code">초대 코드 복사</button>
     </div>
 
     ${
@@ -1271,7 +1378,7 @@ function settingsSheet() {
                   (m) => `<span class="member-tag">
                     <span class="dot" style="width:9px;height:9px;border-radius:50%;background:${esc(m.color)}"></span>
                     ${esc(m.name)}${m.id === state.me?.id ? " (나)" : ""}
-                    ${m.claimed ? '<span title="개인 PIN 등록됨" style="font-size:11px">🔒</span>' : ""}
+                    ${m.claimed ? '<span title="비밀번호 등록됨" style="font-size:11px">🔒</span>' : ""}
                     <button class="x" data-action="del-member" data-id="${esc(m.id)}"
                             aria-label="${esc(m.name)} 삭제">×</button></span>`,
                 )
@@ -1324,7 +1431,6 @@ document.addEventListener("click", async (e) => {
 
       case "do-create": {
         const name = document.getElementById("f-name").value.trim();
-        const pin = document.getElementById("f-pin").value.trim();
         const members = document
           .getElementById("f-members")
           .value.split(",")
@@ -1332,26 +1438,28 @@ document.addEventListener("click", async (e) => {
           .filter(Boolean);
         const signupCode = document.getElementById("f-signup").value.trim();
         if (!name) return sheetError("가족 이름을 입력해 주세요.");
-        if (!/^\d{4,8}$/.test(pin)) return sheetError("PIN은 숫자 4~8자리로 만들어 주세요.");
         if (!signupCode) return sheetError("설치 코드를 입력해 주세요.");
         const res = await api("/family/create", {
           method: "POST",
-          body: { name, pin, members, signupCode },
+          body: { name, members, signupCode },
+          noAuth: true,
         });
         localStorage.setItem(TOKEN_KEY, res.token);
         state.token = res.token;
         state.familyName = res.family.name;
-        state.joinCodeHint = res.family.joinCode;
         closeSheet();
         await refresh();
-        return toast(`초대 코드 ${res.family.joinCode} · 이제 내 프로필을 골라주세요`);
+        return toast("가족 공간을 만들었어요. 이제 내 이름을 골라 주세요");
       }
 
       case "do-join": {
-        const joinCode = document.getElementById("j-code").value.trim().toUpperCase();
-        const pin = document.getElementById("j-pin").value.trim();
-        if (!joinCode || !pin) return sheetError("초대 코드와 PIN을 모두 입력해 주세요.");
-        const res = await api("/family/join", { method: "POST", body: { joinCode, pin } });
+        const inviteCode = document.getElementById("j-code").value.trim();
+        if (!inviteCode) return sheetError("초대 코드를 입력해 주세요.");
+        const res = await api("/family/join", {
+          method: "POST",
+          body: { inviteCode },
+          noAuth: true,
+        });
         localStorage.setItem(TOKEN_KEY, res.token);
         state.token = res.token;
         state.familyName = res.family.name;
@@ -1539,21 +1647,9 @@ document.addEventListener("click", async (e) => {
       case "pick-profile":
         return profilePinSheet(id, el.dataset.name, el.dataset.claimed === "1");
 
-      case "do-claim": {
-        const pin = document.getElementById("p-pin").value.trim();
-        if (!/^\d{4,8}$/.test(pin)) {
-          return sheetError("개인 PIN은 숫자 4~8자리로 입력해 주세요.");
-        }
-        const res = await api("/members/claim", {
-          method: "POST",
-          body: { memberId: id, pin },
-        });
-        localStorage.setItem(TOKEN_KEY, res.token);
-        state.token = res.token;
-        closeSheet();
-        await refresh();
-        return toast(`${res.me.name} 님으로 로그인했어요`);
-      }
+      case "pin-key": return pinPress(el.dataset.k);
+      case "pin-back": return pinPress("back");
+      case "pin-ok": return submitPin();
 
       case "add-self": {
         const input = document.getElementById("p-newname");
@@ -1576,7 +1672,28 @@ document.addEventListener("click", async (e) => {
         return copy(`${location.origin}/api/widget/${state.me.widgetToken}`, "내 위젯 주소");
 
       case "copy-url": return copy(location.origin, "앱 주소");
-      case "copy-code": return copy(state.family.joinCode, "초대 코드");
+      case "share-invite": {
+        const url = inviteLink(state.family.inviteCode);
+        const text = `${state.family.name} 가족 알림에 초대합니다. 링크를 누르고 내 이름을 골라 주세요.`;
+        if (navigator.share) {
+          try {
+            await navigator.share({ title: "우리가족 알림 초대", text, url });
+            return;
+          } catch (e) {
+            if (e?.name === "AbortError") return;
+          }
+        }
+        return copy(`${text}\n${url}`, "초대 링크");
+      }
+
+      case "reset-invite": {
+        if (!confirm("새 초대 링크를 만들까요? 지금 링크는 더 이상 쓸 수 없게 됩니다.")) return;
+        const res = await api("/family/invite/reset", { method: "POST" });
+        state.family.inviteCode = res.inviteCode;
+        closeSheet();
+        settingsSheet();
+        return toast("새 초대 링크를 만들었어요");
+      }
       case "copy-widget":
         return copy(`${location.origin}/api/widget/${state.family.widgetToken}`, "위젯 주소");
 
@@ -1617,20 +1734,40 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && state.token && !sheetEl) refresh().catch(() => {});
 });
 
+document.addEventListener("keydown", (e) => {
+  if (!pinEntry || !sheetEl) return;
+  if (/^[0-9]$/.test(e.key)) pinPress(e.key);
+  else if (e.key === "Backspace") pinPress("back");
+  else if (e.key === "Enter") submitPin();
+});
+
+// 앱이 열린 상태에서 초대 링크를 다시 누른 경우
+window.addEventListener("hashchange", () => {
+  handleInviteLink().catch((err) => toast(err.message));
+});
+
 /* ------------------------------ 시작 ------------------------------ */
 
 state.today = todayISO();
 
-if (state.token) {
-  refresh().catch((err) => {
+(async () => {
+  try {
+    if (await handleInviteLink()) return;
+  } catch (err) {
+    // 링크가 틀려도 기존 로그인은 그대로 이어간다
+    toast(err.message);
+  }
+  if (state.token) {
+    refresh().catch((err) => {
+      state.loading = false;
+      render();
+      toast(err.message);
+    });
+  } else {
     state.loading = false;
     render();
-    toast(err.message);
-  });
-} else {
-  state.loading = false;
-  render();
-}
+  }
+})();
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));

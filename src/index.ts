@@ -42,6 +42,27 @@ const VISIBILITIES = new Set(["family", "private"]);
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const PIN_RE = /^\d{4,8}$/;
+/** 초대 코드 길이. 32종 문자 12자리 = 60비트 */
+const INVITE_LEN = 12;
+
+/** 사람이 옮겨 적은 초대 코드를 정규화한다 (대소문자·하이픈·공백 무시) */
+function normalizeInvite(v: string): string {
+  return v.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+/** 초대 코드를 새로 발급한다. 유일 인덱스 충돌 시 다시 뽑는다. */
+async function issueInviteCode(db: D1Database, familyId: string): Promise<string> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = makeJoinCode(INVITE_LEN);
+    try {
+      await db.prepare(`UPDATE families SET invite_code = ? WHERE id = ?`).bind(code, familyId).run();
+      return code;
+    } catch {
+      // 충돌 → 다시 시도
+    }
+  }
+  throw new HttpError(409, "초대 링크를 만들지 못했습니다. 다시 시도해 주세요.");
+}
 
 class HttpError extends Error {
   constructor(public status: 400 | 401 | 403 | 404 | 409 | 429, message: string) {
@@ -161,33 +182,32 @@ app.post("/api/family/create", async (c) => {
   }
 
   const name = str(body.name, "가족 이름", 40)!;
-  const pin = str(body.pin, "PIN", 8)!;
-  if (!PIN_RE.test(pin)) throw new HttpError(400, "PIN은 숫자 4~8자리로 만들어 주세요.");
   if (!c.env.AUTH_SECRET) throw new HttpError(403, "서버에 AUTH_SECRET이 설정되지 않았습니다.");
 
   const id = randomId();
   const widgetToken = randomId(24);
-  const pinHash = await hashPin(pin);
   const created = nowIso();
 
-  // 초대 코드 충돌 시 재시도
-  let joinCode = "";
+  // 가족 공용 PIN은 쓰지 않는다 — 초대 링크가 그 역할을 한다.
+  // pin_hash 는 NOT NULL 이라 사용 안 함 표시만 남기고,
+  // join_code(옛 짧은 코드)는 유일 제약 때문에 계속 채워 둔다.
+  let inviteCode = "";
   for (let attempt = 0; attempt < 6; attempt++) {
-    joinCode = makeJoinCode();
+    inviteCode = makeJoinCode(INVITE_LEN);
     try {
       await c.env.DB.prepare(
-        `INSERT INTO families (id, name, join_code, pin_hash, widget_token, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO families (id, name, join_code, invite_code, pin_hash, widget_token, created_at)
+         VALUES (?, ?, ?, ?, 'disabled', ?, ?)`,
       )
-        .bind(id, name, joinCode, pinHash, widgetToken, created)
+        .bind(id, name, makeJoinCode(), inviteCode, widgetToken, created)
         .run();
       break;
     } catch (e) {
       if (attempt === 5) throw e;
-      joinCode = "";
+      inviteCode = "";
     }
   }
-  if (!joinCode) throw new HttpError(409, "초대 코드 생성에 실패했습니다. 다시 시도해 주세요.");
+  if (!inviteCode) throw new HttpError(409, "초대 링크 생성에 실패했습니다. 다시 시도해 주세요.");
 
   // 입력된 구성원 이름들 등록
   const names: string[] = Array.isArray(body.members) ? body.members : [];
@@ -213,7 +233,7 @@ app.post("/api/family/create", async (c) => {
   return c.json({
     // 아직 "내가 누구인지"는 고르지 않은 상태의 토큰
     token: await signToken({ familyId: id, memberId: null }, c.env.AUTH_SECRET),
-    family: { id, name, joinCode, widgetToken },
+    family: { id, name, inviteCode, widgetToken },
     members: created_members.results ?? [],
   });
 });
@@ -223,46 +243,20 @@ app.post("/api/family/join", async (c) => {
   await guard(c, "join", 10, 60);
 
   const body = await c.req.json().catch(() => ({}));
-  const code = str(body.joinCode, "초대 코드", 12)!.toUpperCase();
-  const pin = str(body.pin, "PIN", 8)!;
+  const code = normalizeInvite(str(body.inviteCode, "초대 코드", 40)!);
   if (!c.env.AUTH_SECRET) throw new HttpError(403, "서버에 AUTH_SECRET이 설정되지 않았습니다.");
+  if (code.length !== INVITE_LEN) {
+    throw new HttpError(401, "초대 링크가 올바르지 않습니다. 가족에게 새 링크를 받아 주세요.");
+  }
 
   const row = await c.env.DB.prepare(
-    `SELECT id, name, join_code, pin_hash, widget_token, fail_count, locked_until
-     FROM families WHERE join_code = ?`,
+    `SELECT id, name, invite_code, widget_token FROM families WHERE invite_code = ?`,
   )
     .bind(code)
-    .first<{
-      id: string;
-      name: string;
-      join_code: string;
-      pin_hash: string;
-      widget_token: string;
-      fail_count: number;
-      locked_until: string | null;
-    }>();
-
-  // 코드가 틀린 경우와 PIN이 틀린 경우를 구분해서 알려주지 않는다
-  if (!row) throw new HttpError(401, "초대 코드 또는 PIN이 올바르지 않습니다.");
-
-  if (row.locked_until && row.locked_until > nowIso()) {
-    throw new HttpError(429, "PIN을 여러 번 틀렸습니다. 5분 후 다시 시도해 주세요.");
+    .first<{ id: string; name: string; invite_code: string; widget_token: string }>();
+  if (!row) {
+    throw new HttpError(401, "초대 링크가 올바르지 않거나 새 링크로 바뀌었습니다.");
   }
-
-  if (!(await verifyPin(pin, row.pin_hash))) {
-    const fails = row.fail_count + 1;
-    const lockUntil = fails >= 5 ? new Date(Date.now() + 5 * 60_000).toISOString() : null;
-    await c.env.DB.prepare(
-      `UPDATE families SET fail_count = ?, locked_until = ? WHERE id = ?`,
-    )
-      .bind(lockUntil ? 0 : fails, lockUntil, row.id)
-      .run();
-    throw new HttpError(401, "초대 코드 또는 PIN이 올바르지 않습니다.");
-  }
-
-  await c.env.DB.prepare(`UPDATE families SET fail_count = 0, locked_until = NULL WHERE id = ?`)
-    .bind(row.id)
-    .run();
 
   const roster = await c.env.DB.prepare(
     `SELECT id, name, color, (pin_hash IS NOT NULL) AS claimed
@@ -273,9 +267,15 @@ app.post("/api/family/join", async (c) => {
 
   return c.json({
     token: await signToken({ familyId: row.id, memberId: null }, c.env.AUTH_SECRET),
-    family: { id: row.id, name: row.name, joinCode: row.join_code, widgetToken: row.widget_token },
+    family: { id: row.id, name: row.name, inviteCode: row.invite_code, widgetToken: row.widget_token },
     members: roster.results ?? [],
   });
+});
+
+/** 초대 링크가 퍼졌을 때 새로 만든다. 이전 링크는 즉시 막히고, 이미 들어온 가족은 그대로다. */
+app.post("/api/family/invite/reset", requireMember, async (c) => {
+  const inviteCode = await issueInviteCode(c.env.DB, c.get("familyId"));
+  return c.json({ inviteCode });
 });
 
 /* ------------------------------ 내 프로필 선택 (구성원 로그인) ------------------------------ */
@@ -288,7 +288,10 @@ app.get("/api/members/roster", requireFamily, async (c) => {
   )
     .bind(c.get("familyId"))
     .all();
-  return c.json({ members: rows.results ?? [] });
+  const fam = await c.env.DB.prepare(`SELECT name FROM families WHERE id = ?`)
+    .bind(c.get("familyId"))
+    .first<{ name: string }>();
+  return c.json({ members: rows.results ?? [], familyName: fam?.name ?? null });
 });
 
 /**
@@ -302,8 +305,8 @@ app.post("/api/members/claim", requireFamily, async (c) => {
   const familyId = c.get("familyId");
   const body = await c.req.json().catch(() => ({}));
   const memberId = str(body.memberId, "구성원", 40)!;
-  const pin = str(body.pin, "개인 PIN", 8)!;
-  if (!PIN_RE.test(pin)) throw new HttpError(400, "개인 PIN은 숫자 4~8자리로 만들어 주세요.");
+  const pin = str(body.pin, "비밀번호", 8)!;
+  if (!PIN_RE.test(pin)) throw new HttpError(400, "비밀번호는 숫자 4~8자리로 만들어 주세요.");
 
   const member = await c.env.DB.prepare(
     `SELECT id, name, color, pin_hash, widget_token, fail_count, locked_until
@@ -322,7 +325,7 @@ app.post("/api/members/claim", requireFamily, async (c) => {
   if (!member) throw new HttpError(404, "구성원을 찾을 수 없습니다.");
 
   if (member.locked_until && member.locked_until > nowIso()) {
-    throw new HttpError(429, "개인 PIN을 여러 번 틀렸습니다. 5분 후 다시 시도해 주세요.");
+    throw new HttpError(429, "비밀번호를 여러 번 틀렸습니다. 5분 후 다시 시도해 주세요.");
   }
 
   const widgetToken = member.widget_token ?? randomId(24);
@@ -343,7 +346,7 @@ app.post("/api/members/claim", requireFamily, async (c) => {
       )
         .bind(lockUntil ? 0 : fails, lockUntil, member.id)
         .run();
-      throw new HttpError(401, "개인 PIN이 올바르지 않습니다.");
+      throw new HttpError(401, "비밀번호가 올바르지 않습니다.");
     }
     await c.env.DB.prepare(
       `UPDATE members SET fail_count = 0, locked_until = NULL, widget_token = ? WHERE id = ?`,
@@ -368,9 +371,9 @@ app.get("/api/state", requireMember, async (c) => {
   const to = addDays(today, 120);
 
   const [family, members, events, memos] = await Promise.all([
-    c.env.DB.prepare(`SELECT id, name, join_code, widget_token FROM families WHERE id = ?`)
+    c.env.DB.prepare(`SELECT id, name, invite_code, widget_token FROM families WHERE id = ?`)
       .bind(familyId)
-      .first<{ id: string; name: string; join_code: string; widget_token: string }>(),
+      .first<{ id: string; name: string; invite_code: string | null; widget_token: string }>(),
     c.env.DB.prepare(
       `SELECT id, name, color, (pin_hash IS NOT NULL) AS claimed
        FROM members WHERE family_id = ? ORDER BY sort_order, created_at`,
@@ -400,6 +403,9 @@ app.get("/api/state", requireMember, async (c) => {
 
   if (!family) throw new HttpError(404, "가족 정보를 찾을 수 없습니다.");
 
+  // 초대 링크 방식 이전에 만들어진 가족은 초대 코드가 없다 → 처음 조회할 때 발급한다
+  const inviteCode = family.invite_code ?? (await issueInviteCode(c.env.DB, family.id));
+
   const occurrences = expandOccurrences(events.results ?? [], from, to).map((o) => ({
     ...o,
     date: o.occurs_on,
@@ -418,7 +424,7 @@ app.get("/api/state", requireMember, async (c) => {
     family: {
       id: family.id,
       name: family.name,
-      joinCode: family.join_code,
+      inviteCode,
       widgetToken: family.widget_token,
     },
     me: {

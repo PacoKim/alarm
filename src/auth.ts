@@ -100,13 +100,13 @@ export interface Session {
 }
 
 /**
- * 서명된 세션 토큰 발급 (기본 180일).
+ * 서명된 세션 토큰 발급 (기본 365일).
  * memberId가 없는 토큰은 "가족 공간에는 들어왔지만 내가 누군지는 아직 안 고른" 상태다.
  */
 export async function signToken(
   session: Session,
   secret: string,
-  days = 180,
+  days = 365,
 ): Promise<string> {
   const exp = Date.now() + days * 86_400_000;
   const payload = b64urlEncode(

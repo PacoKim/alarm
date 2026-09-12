@@ -861,3 +861,81 @@ details[open] > summary::before { content: "− "; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* ==========================  초대 링크 · 비밀번호 키패드  ========================== */
+
+.invite-hint {
+  display: flex; align-items: center; gap: 13px;
+  padding: 16px 17px;
+  margin-bottom: 14px;
+  border-radius: var(--r);
+  background: var(--brand-soft);
+  border: 1px solid color-mix(in srgb, var(--brand) 22%, transparent);
+  font-size: 14.5px; line-height: 1.55; color: var(--text);
+}
+.invite-hint .ic { font-size: 28px; flex: 0 0 auto; }
+
+.info-card .v.invite {
+  font-size: 21px;
+  letter-spacing: 0.08em;
+  margin: 10px 0 14px;
+  white-space: nowrap;
+}
+
+.avatar.lg { width: 38px; height: 38px; font-size: 16px; }
+
+.pin-dots {
+  display: flex; justify-content: center; gap: 12px;
+  min-height: 56px;
+  margin: 6px 0 24px;
+}
+.pin-dot {
+  width: 50px; height: 56px;
+  border-radius: 15px;
+  border: 2px solid var(--line-strong);
+  background: var(--surface);
+  display: grid; place-items: center;
+  font-size: 26px; font-weight: 800;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  transition: border-color 0.15s, background 0.15s, transform 0.15s;
+}
+.pin-dot.on { border-color: var(--brand); background: var(--brand-soft); transform: scale(1.04); }
+
+/* 로그인할 때는 숫자 대신 점 */
+.pin-dots.masked { gap: 16px; align-items: center; }
+.pin-dots.masked .pin-dot { width: 18px; height: 18px; border-radius: 50%; }
+.pin-dots.masked .pin-dot.on { background: var(--brand); transform: scale(1.1); }
+.pin-dots.shake { animation: shake 0.36s; }
+
+.keypad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  max-width: 340px;
+  margin: 0 auto;
+}
+.key {
+  height: 64px;
+  border-radius: 18px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: var(--sh-1);
+  font-size: 27px; font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  transition: transform 0.08s, background 0.12s;
+  touch-action: manipulation;
+}
+.key:active { transform: scale(0.93); background: var(--surface-2); }
+.key.ghost { background: transparent; border-color: transparent; box-shadow: none; color: var(--text-dim); font-size: 23px; }
+.key.ok {
+  background: var(--grad); color: #fff; border: none;
+  font-size: 17px; font-weight: 800;
+  box-shadow: var(--sh-brand);
+}
+
+@keyframes shake {
+  20%, 60% { transform: translateX(-9px); }
+  40%, 80% { transform: translateX(9px); }
+}
