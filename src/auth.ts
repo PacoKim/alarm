@@ -21,7 +21,13 @@ export function makeJoinCode(len = 6): string {
 
 /* ---------- PIN 해싱 (PBKDF2-SHA256) ---------- */
 
-const PBKDF2_ITERATIONS = 120_000;
+/**
+ * Cloudflare Workers는 PBKDF2 반복 횟수를 10만 회로 제한한다.
+ * 이를 넘기면 프로덕션에서 NotSupportedError로 실패한다
+ * (로컬 workerd는 제한을 적용하지 않아 로컬 테스트만으로는 드러나지 않는다).
+ * PIN은 4~8자리라 반복 횟수보다 5회 실패 잠금과 IP 요청 제한이 실질적인 방어선이다.
+ */
+const PBKDF2_ITERATIONS = 100_000;
 
 export async function hashPin(pin: string): Promise<string> {
   const salt = randomId(16);
