@@ -22,55 +22,42 @@
 
 ---
 
-## 1. 배포 (한 번만)
+## 1. 배포
+
+Cloudflare **Pages** 프로젝트 `alarm` 에 배포하며, 주소는 `alarm-7bi.pages.dev` 다.
+`public/` 폴더를 그대로 올리고, 그 안의 `_worker.js` 가 모든 요청을 처리한다
+(Pages 고급 모드). 정적 파일은 코드에서 `env.ASSETS` 로 꺼낸다.
 
 ```bash
-cd ~/family-reminder && npm run setup
+npm run deploy      # src/ 번들 → public/_worker.js 생성 후 배포
 ```
 
-이 명령이 순서대로 처리한다.
-
-1. Cloudflare 로그인 (브라우저가 열림)
-2. D1 데이터베이스 `family-reminder` 생성 후 `wrangler.jsonc`에 ID 기록
-3. 원격 DB에 테이블 생성
-4. `AUTH_SECRET` 시크릿 자동 생성·등록
-5. 배포
-
-끝나면 `https://alarm.<계정서브도메인>.workers.dev` 주소가 출력된다.
-
-### 주소 구조와 계정 서브도메인
-`workers.dev` 주소는 `<워커이름>.<계정서브도메인>.workers.dev` 구조다.
-워커 이름은 `wrangler.jsonc`의 `name`으로 바꾸지만, 가운데 계정 서브도메인은
-`wrangler`에 해당 명령이 없어 대시보드에서만 변경된다.
-
-Cloudflare 대시보드 → **Compute (Workers)** → 우측 **Subdomain** → 변경.
-계정 전체의 Worker 주소가 함께 바뀌므로 한 번만 하면 된다.
-
-바꾼 직후에는 새 서브도메인의 TLS 인증서가 엣지에 퍼지기까지 몇 분간
-HTTPS 연결이 실패할 수 있다. DNS는 이미 응답하고 `http://`로는 200이 오는데
-`https://`만 안 되면 이 상태이므로, 코드를 고치지 말고 잠시 기다리면 된다.
-
-Cloudflare Pages는 대안이 되지 않는다. Pages가 Workers로 통합되어
-새 프로젝트도 `<이름>.<계정서브도메인>.workers.dev` 주소를 받는다.
-계정 서브도메인이 전혀 없는 주소를 쓰려면 도메인을 연결해야 한다(아래 참조).
+GitHub `main` 에 푸시하면 Pages가 자동으로 다시 배포한다.
+`public/_worker.js` 는 저장소에 함께 커밋되므로 Pages 쪽 빌드 명령 설정이 필요 없다.
+**src/ 를 수정했으면 `npm run build` 로 `_worker.js` 를 다시 만들어 함께 커밋해야 한다.**
 
 <details>
-<summary>수동으로 하려면</summary>
+<summary>처음 세팅하는 경우 (다른 계정에 배포할 때)</summary>
 
 ```bash
 npx wrangler login
-npx wrangler d1 create family-reminder          # 출력된 database_id를 wrangler.jsonc에 붙여넣기
+npx wrangler d1 create family-reminder     # database_id 를 wrangler.jsonc 에 기록
 npx wrangler d1 migrations apply family-reminder --remote
-npx wrangler secret put AUTH_SECRET             # 32바이트 랜덤 문자열
-npx wrangler deploy
+npx wrangler pages secret put AUTH_SECRET  --project-name alarm   # 32바이트 랜덤
+npx wrangler pages secret put SIGNUP_CODE  --project-name alarm   # 가족 공간 생성용 코드
+npm run deploy
 ```
 </details>
 
-**내 도메인을 쓰려면** — Cloudflare 대시보드 → Workers & Pages → `family-reminder` →
-Settings → Domains & Routes에서 `family.example.com` 같은 주소를 연결한다.
-(도메인이 Cloudflare에 등록되어 있어야 한다.)
+### 왜 Workers 대신 Pages인가
+`workers.dev` 주소는 `<워커이름>.<계정서브도메인>.workers.dev` 구조라 계정
+서브도메인이 반드시 들어간다. 계정 이름을 주소에 노출하지 않으려고 Pages의
+`*.pages.dev` 주소를 쓴다.
 
----
+주의: Cloudflare가 Pages를 Workers로 통합하는 중이라, **새로** 만드는 Pages
+프로젝트는 `pages.dev` 가 아니라 workers.dev 주소를 받는다. 이 프로젝트는 통합
+이전에 만들어져 `pages.dev` 주소를 유지하고 있다. 새 계정에서 같은 주소 형태를
+원하면 도메인을 직접 연결하는 편이 낫다.
 
 ## 2. 로그인 구조
 
