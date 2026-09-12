@@ -38,14 +38,21 @@ cd ~/family-reminder && npm run setup
 
 끝나면 `https://alarm.<계정서브도메인>.workers.dev` 주소가 출력된다.
 
-### 주소에서 계정 아이디 지우기
+### 주소 구조와 계정 서브도메인
 `workers.dev` 주소는 `<워커이름>.<계정서브도메인>.workers.dev` 구조다.
-가운데 계정 서브도메인은 코드로 바꿀 수 없고 대시보드에서만 변경된다.
+워커 이름은 `wrangler.jsonc`의 `name`으로 바꾸지만, 가운데 계정 서브도메인은
+`wrangler`에 해당 명령이 없어 대시보드에서만 변경된다.
 
-Cloudflare 대시보드 → **Compute (Workers)** → 우측 **Subdomain** →
-원하는 이름으로 변경. 계정 전체에 적용되므로 한 번만 하면 된다.
+Cloudflare 대시보드 → **Compute (Workers)** → 우측 **Subdomain** → 변경.
+계정 전체의 Worker 주소가 함께 바뀌므로 한 번만 하면 된다.
 
-완전히 다른 주소를 쓰려면 도메인을 연결한다(아래 참조).
+바꾼 직후에는 새 서브도메인의 TLS 인증서가 엣지에 퍼지기까지 몇 분간
+HTTPS 연결이 실패할 수 있다. DNS는 이미 응답하고 `http://`로는 200이 오는데
+`https://`만 안 되면 이 상태이므로, 코드를 고치지 말고 잠시 기다리면 된다.
+
+Cloudflare Pages는 대안이 되지 않는다. Pages가 Workers로 통합되어
+새 프로젝트도 `<이름>.<계정서브도메인>.workers.dev` 주소를 받는다.
+계정 서브도메인이 전혀 없는 주소를 쓰려면 도메인을 연결해야 한다(아래 참조).
 
 <details>
 <summary>수동으로 하려면</summary>
